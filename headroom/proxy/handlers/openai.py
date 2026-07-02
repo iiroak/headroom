@@ -1757,7 +1757,7 @@ class OpenAIHandlerMixin:
         headers.pop("content-length", None)
         # Strip accept-encoding so httpx negotiates its own encoding.
         # Cloudflare Workers forward "br, zstd" which OpenAI may honor;
-        # if httpx lacks brotli support the response body is undecipherable → 502.
+        # if httpx lacks broteli support the response body is undecipherable → 502.
         headers.pop("accept-encoding", None)
         tags = extract_tags(headers)
         client = classify_client(headers)
@@ -2729,16 +2729,6 @@ class OpenAIHandlerMixin:
                 # OpenAI has no write penalty — uncached = total - cached
                 uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
-                if self.cost_tracker:
-                    self.cost_tracker.record_tokens(
-                        model,
-                        tokens_saved,
-                        optimized_tokens,
-                        cache_read_tokens=cache_read_tokens,
-                        cache_write_tokens=cache_write_tokens,
-                        uncached_tokens=uncached_input_tokens,
-                    )
-
                 # Memory: handle memory tool calls in OpenAI Chat Completions response.
                 # After executing tools, send a continuation request so the model
                 # can produce a final user-facing response (not just tool_calls).
@@ -2827,6 +2817,7 @@ class OpenAIHandlerMixin:
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         uncached_input_tokens=uncached_input_tokens,
+                        cache_inferred=True,
                         total_latency_ms=total_latency,
                         overhead_ms=optimization_latency,
                         pipeline_timing=pipeline_timing,
@@ -3585,26 +3576,11 @@ class OpenAIHandlerMixin:
                             f"[{request_id}] Memory tool handling failed (responses): {e}"
                         )
 
-                if self.cost_tracker:
-                    cache_write_tokens = _infer_openai_cache_write_tokens(
-                        total_input_tokens,
-                        cache_read_tokens,
-                    )
-                    uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
-                    self.cost_tracker.record_tokens(
-                        model,
-                        tokens_saved,
-                        total_input_tokens,
-                        cache_read_tokens=cache_read_tokens,
-                        cache_write_tokens=cache_write_tokens,
-                        uncached_tokens=uncached_input_tokens,
-                    )
-                else:
-                    cache_write_tokens = _infer_openai_cache_write_tokens(
-                        total_input_tokens,
-                        cache_read_tokens,
-                    )
-                    uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
+                cache_write_tokens = _infer_openai_cache_write_tokens(
+                    total_input_tokens,
+                    cache_read_tokens,
+                )
+                uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
                 effective_optimized_tokens = (
                     total_input_tokens if total_input_tokens > 0 else optimized_tokens
@@ -3640,6 +3616,7 @@ class OpenAIHandlerMixin:
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         uncached_input_tokens=uncached_input_tokens,
+                        cache_inferred=True,
                         total_latency_ms=total_latency,
                         overhead_ms=optimization_latency,
                         transforms_applied=tuple(transforms_applied),
@@ -5211,6 +5188,7 @@ class OpenAIHandlerMixin:
                                     cache_read_tokens=max(0, cache_read_delta),
                                     cache_write_tokens=max(0, cache_write_delta),
                                     uncached_input_tokens=max(0, uncached_delta),
+                                    cache_inferred=max(0, cache_write_delta) > 0,
                                     total_latency_ms=latency_ms,
                                     overhead_ms=overhead_delta_ms,
                                     ttfb_ms=ttfb_for_record_ms,
@@ -5760,6 +5738,7 @@ class OpenAIHandlerMixin:
                         cache_read_tokens=residual_cache_read_tokens,
                         cache_write_tokens=residual_cache_write_tokens,
                         uncached_input_tokens=residual_uncached_input_tokens,
+                        cache_inferred=residual_cache_write_tokens > 0,
                         total_latency_ms=ws_session_duration_ms,
                         overhead_ms=final_overhead_delta_ms,
                         ttfb_ms=final_ttfb_ms,
