@@ -8,7 +8,7 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient
 
-from headroom.proxy.server import ProxyConfig, create_app
+from headroom.proxy.server import ProxyConfig, __version__, create_app
 
 
 @pytest.fixture
@@ -37,6 +37,7 @@ def test_livez_reports_process_health(client):
     assert data["service"] == "headroom-proxy"
     assert data["status"] == "healthy"
     assert data["alive"] is True
+    assert data["version"] == __version__
     assert data["uptime_seconds"] >= 0
 
 
@@ -66,9 +67,7 @@ def test_readyz_reports_core_subsystem_checks(client):
     assert data["checks"]["memory"]["status"] == "disabled"
     assert data["checks"]["upstream"]["provider"] == "anthropic"
     assert data["checks"]["upstream"]["scope"] == "configured_provider_target"
-    assert data["checks"]["upstream"]["dynamic_request_base_url_header"] == (
-        "x-headroom-base-url"
-    )
+    assert data["checks"]["upstream"]["dynamic_request_base_url_header"] == ("x-headroom-base-url")
     assert data["checks"]["upstream"]["dynamic_request_base_urls_probed"] is False
     runtime = data["runtime"]
     assert runtime["anthropic_pre_upstream"]["resolved_concurrency"] == max(
@@ -90,6 +89,7 @@ def test_health_preserves_backwards_compatible_config_payload(client):
     data = response.json()
     assert data["status"] == "healthy"
     assert data["ready"] is True
+    assert data["version"] == __version__
     config = data["config"]
     assert config["backend"] == "anthropic"
     assert config["optimize"] is False

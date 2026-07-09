@@ -1405,7 +1405,7 @@ class HeadroomProxy(
         self.http_client_h1 = (
             self.http_client if not _http2 else httpx.AsyncClient(http2=False, **_client_kwargs)
         )
-        logger.info("Headroom Proxy started")
+        logger.info("Headroom Proxy started (version %s)", __version__)
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
         self.config.mode = normalize_proxy_mode(self.config.mode)
         logger.info(f"Mode: {self.config.mode}")
@@ -1989,7 +1989,9 @@ def _history_opencode_pricing_reference(history: dict[str, Any]) -> dict[str, An
 
     def _float(value: object) -> float:
         try:
-            return float(value or 0)
+            if isinstance(value, str | int | float):
+                return float(value)
+            return 0.0
         except (TypeError, ValueError):
             return 0.0
 
@@ -2069,6 +2071,24 @@ def _is_known_websocket_callback_failure(context: dict[str, Any]) -> bool:
         isinstance(exception, AttributeError)
         and str(exception) == "'ClientConnection' object has no attribute 'recv_messages'"
     )
+
+
+def _tool_schema_saved_from_tags(tags: object) -> int:
+    """Tool-definition tokens Headroom kept out of context for one request by
+    deferring heavy tool schemas: the native tool-search injection
+    (``tool_search_deferred_tokens``) plus any registered turn-hook tools
+    rewrite (``turn_hook_tools_saved_tokens``). Both tags are set only on the
+    path where Headroom performed the deferral, so a client that already had
+    tool search enabled (e.g. Claude Code / Codex) contributes zero here."""
+    if not isinstance(tags, dict):
+        return 0
+    total = 0
+    for key in ("tool_search_deferred_tokens", "turn_hook_tools_saved_tokens"):
+        try:
+            total += int(tags.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
 
 
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
@@ -2988,6 +3008,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """Serve the Headroom dashboard UI."""
         return get_dashboard_html()
 
+    @app.get("/favicon.ico")
+    async def favicon() -> Response:
+        # Registered before register_provider_routes' catch-all passthrough
+        # route so browsers' automatic favicon requests for /dashboard are
+        # answered locally instead of being tunneled to the wrapped upstream
+        # provider (GH #1787).
+        return Response(status_code=204)
+
     DASHBOARD_STATS_CACHE_TTL_SECONDS = 5.0
     _stats_snapshot_lock = asyncio.Lock()
     _stats_snapshot: dict[str, Any] = {"expires_at": 0.0, "value": None}
@@ -3015,6 +3043,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "total_latency_ms": log.get("total_latency_ms"),
                 "transforms_applied": log.get("transforms_applied", []),
                 "waste_signals": log.get("waste_signals"),
+                "tool_schema_saved_tokens": _tool_schema_saved_from_tags(log.get("tags")),
             }
             for log in recent_request_logs
             if log.get("input_tokens_original") is not None
@@ -3126,6 +3155,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         rtk_tokens_avoided = cli_tokens_avoided if cli_filtering_tool == "rtk" else 0
         lean_ctx_tokens_avoided = cli_tokens_avoided if cli_filtering_tool == "lean-ctx" else 0
+        cli_filtering_available = bool(
+            cli_filtering_stats and cli_filtering_stats.get("installed", False)
+        )
 
         # Calculate total tokens before Headroom-side reduction. Proxy
         # compression and the configured context tool both remove tokens before
@@ -3196,6 +3228,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         display_session = persistent_savings.get("display_session", {})
         recent_request_logs = proxy.logger.get_recent(10_000) if proxy.logger else []
         recent_request_payload = _build_recent_request_payload()
+
+        # Tool-schema deferral savings: tool-definition tokens kept out of the
+        # model's context by deferring heavy schemas until they're needed
+        # (native tool-search injection + any registered turn-hook tools
+        # rewrite). Attributed to Headroom only — see _tool_schema_saved_from_tags.
+        # Aggregated over the recent request-log window.
+        tool_schema_tokens = 0
+        tool_schema_requests = 0
+        for _ts_log in recent_request_logs:
+            _ts_saved = _tool_schema_saved_from_tags(_ts_log.get("tags"))
+            if _ts_saved > 0:
+                tool_schema_tokens += _ts_saved
+                tool_schema_requests += 1
         agent_usage = _build_agent_usage_summary(
             recent_request_logs,
             requests_by_provider=dict(m.requests_by_provider),
@@ -3240,6 +3285,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "cli_filtering": {
                         "tool": cli_filtering_tool,
                         "label": cli_filtering_label,
+                        "available": cli_filtering_available,
                         "tokens": cli_tokens_avoided,
                         "tokens_saved": cli_tokens_avoided,
                         "session": cli_filtering_session,
@@ -3293,6 +3339,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                             "steered verbosity / routed effort down. Counterfactual — "
                             "shown as an estimate (vs a learned baseline) or measured "
                             "(A/B holdout), always with a confidence band."
+                        ),
+                    },
+                    "tool_search": {
+                        "tokens": tool_schema_tokens,
+                        "tokens_saved": tool_schema_tokens,
+                        "requests": tool_schema_requests,
+                        "window": len(recent_request_logs),
+                        "description": (
+                            "Tool-definition tokens kept out of the model's context "
+                            "by deferring heavy tool schemas until they're searched "
+                            "for. Counted only when Headroom performed the deferral — "
+                            "not when the client (e.g. Claude Code / Codex) already "
+                            "had tool search enabled. Aggregated over the recent "
+                            "request window."
                         ),
                     },
                 },
@@ -3508,9 +3568,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "context_tool": {
                 "configured": cli_filtering_tool,
                 "label": cli_filtering_label,
-                "available": bool(
-                    cli_filtering_stats and cli_filtering_stats.get("installed", False)
-                ),
+                "available": cli_filtering_available,
                 "stats": cli_filtering_stats,
             },
             "cli_filtering": cli_filtering_stats,
@@ -3632,11 +3690,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """Get durable proxy compression history plus display-session state.
 
         The JSON payload also carries a ``cli_filtering`` key with live RTK
-        stats. This is a curated subset (``tool``, ``label``, ``lifetime``,
-        ``session``) tailored to the Historical tab, not the full
-        ``_get_context_tool_stats()`` payload that ``/stats`` exposes. It is
-        ``None`` when RTK is absent or its stats cannot be read, so the tab
-        simply hides the card rather than erroring.
+        stats. This is a curated subset (``tool``, ``label``, ``available``,
+        ``lifetime``, ``session``) tailored to the Historical tab, not the
+        full ``_get_context_tool_stats()`` payload that ``/stats`` exposes.
+        It is ``None`` only when the stats read hard-fails; when the tool is
+        merely absent, ``cli_filtering`` stays populated with
+        ``available: False`` and zeroed counters so the tab can distinguish
+        "not installed" from "installed, no data yet."
         """
         if format == "csv":
             filename = f"headroom-stats-history-{series}.csv"
@@ -3667,6 +3727,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             history["cli_filtering"] = {
                 "tool": str(cli_stats.get("tool", "rtk")),
                 "label": str(cli_stats.get("label", "RTK")),
+                "available": bool(cli_stats.get("installed", False)),
                 "lifetime": cli_stats.get("lifetime", {}),
                 "session": cli_stats.get("session", {}),
             }
@@ -4336,7 +4397,13 @@ def _proxy_config_from_env() -> ProxyConfig:
         periodic_toin_stats_enabled=_get_env_bool("HEADROOM_PERIODIC_TOIN_STATS", True),
         proxy_token=os.environ.get("HEADROOM_PROXY_TOKEN") or None,
         offline=_get_env_bool("HEADROOM_OFFLINE", False),
-        mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
+        # Default mode is CACHE (Headroom's coding posture): delta-only compression
+        # at ~0 prefix-cache busts. HEADROOM_MODE overrides.
+        mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_CACHE)),
+        # Default savings profile is "coding" so proxy_pipeline_kwargs applies its
+        # posture (compress_user, protect_recent, min_tokens). HEADROOM_SAVINGS_PROFILE
+        # overrides.
+        savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
         read_maturation=_get_env_bool("HEADROOM_READ_MATURATION", False),
         read_maturation_quiesce_turns=_get_env_int("HEADROOM_READ_MATURATION_QUIESCE_TURNS", 5),
         read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
@@ -4347,6 +4414,12 @@ def _proxy_config_from_env() -> ProxyConfig:
 
 
 def create_app_from_env() -> FastAPI:
+    # Seed the coding-profile defaults into the process env BEFORE reading config,
+    # so the uvicorn factory launch gets Headroom's out-of-box posture (cache mode,
+    # tool-search, dedupe, read protection, …). setdefault → explicit env wins.
+    from headroom.agent_savings import seed_proxy_env_defaults
+
+    seed_proxy_env_defaults()
     return create_app(_proxy_config_from_env())
 
 
@@ -4384,6 +4457,16 @@ def run_server(
     if not FASTAPI_AVAILABLE:
         print("ERROR: FastAPI required. Install: pip install fastapi uvicorn httpx")
         sys.exit(1)
+
+    # Seed the request-time coding-profile toggles (tool-search, dedupe, read
+    # protection, lossless→lossy, effort-router, block-char floor) into the
+    # process env before serving, so downstream per-request readers pick them up.
+    # Done here (not in the CLI command) so unit tests that mock run_server never
+    # mutate os.environ. setdefault → explicit env still wins. MODE / profile are
+    # already resolved into `config` above via their inline defaults.
+    from headroom.agent_savings import seed_proxy_env_defaults
+
+    seed_proxy_env_defaults()
 
     config = config or ProxyConfig()
     code_aware_status = _get_code_aware_banner_status(config)
@@ -4992,10 +5075,10 @@ if __name__ == "__main__":
         protect_tool_results=frozenset(protect_tool_results)
         if protect_tool_results
         else frozenset(),
-        mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
+        mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_CACHE)),
         compress_user_messages=args.compress_user_messages
         or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
-        savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or None,
+        savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
         # Default 0.4 keep-ratio so the Kompress text (prose/code) path compresses
         # meaningfully out of the box; HEADROOM_TARGET_RATIO overrides.
         target_ratio=(

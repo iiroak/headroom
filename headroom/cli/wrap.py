@@ -45,6 +45,7 @@ import click
 
 from headroom import fsutil
 from headroom._version import __version__ as _HEADROOM_VERSION
+from headroom._version import normalize_release_version as _normalize_release_version
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
@@ -2533,11 +2534,12 @@ def _proxy_version(payload: dict[str, Any] | None) -> str | None:
 def _proxy_needs_version_restart(payload: dict[str, Any] | None) -> bool:
     """Return True when a running Headroom proxy uses a different package version."""
     running_version = _proxy_version(payload)
+    running_release = _normalize_release_version(running_version)
+    current_release = _normalize_release_version(_HEADROOM_VERSION)
     return (
-        running_version is not None
-        and running_version != "unknown"
-        and _HEADROOM_VERSION != "unknown"
-        and running_version != _HEADROOM_VERSION
+        running_release is not None
+        and current_release is not None
+        and running_release != current_release
     )
 
 
@@ -4992,14 +4994,32 @@ def cursor(
         headroom wrap cursor --port 9999    # Custom proxy port
     """
     cursorrules: Path | None = Path.cwd() / ".cursorrules" if not no_rtk else None
+    cursor_hook_registered = False
     if not no_rtk:
+
+        def _register_cursor_hook(rtk_path: Path) -> None:
+            # rtk registers a native hook for Cursor (`rtk init --agent cursor`),
+            # same mechanism as Claude Code. Prefer that over injecting the
+            # RTK_INSTRUCTIONS_BLOCK text into .cursorrules — a silent hook makes
+            # the custom-rules text redundant guidance (GH #756).
+            nonlocal cursor_hook_registered
+            from headroom.rtk.installer import register_agent_hooks
+
+            # rtk may exit 0 without writing hooks.json (e.g. an rtk build that
+            # doesn't support --agent cursor), so trust the file, not the exit
+            # code: only skip the .cursorrules fallback if the native hook is
+            # actually on disk (GH #756).
+            cursor_hooks_json = Path.home() / ".cursor" / "hooks.json"
+            if register_agent_hooks(rtk_path, agent="cursor") and cursor_hooks_json.is_file():
+                cursor_hook_registered = True
+            else:
+                _inject_rtk_instructions(cast(Path, cursorrules), verbose=verbose)
+
         _setup_context_tool_for_agent(
             agent="cursor",
             agent_display="Cursor",
             marker_path=cursorrules,
-            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
-                cast(Path, cursorrules), verbose=verbose
-            ),
+            on_rtk_ready=_register_cursor_hook,
             verbose=verbose,
         )
 
@@ -5013,6 +5033,8 @@ def cursor(
             click.echo()
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
                 click.echo("  lean-ctx configured for Cursor")
+            elif cursor_hook_registered:
+                click.echo("  rtk hook registered for Cursor")
             else:
                 click.echo("  rtk instructions injected into .cursorrules")
             click.echo("  Cursor will use token-optimized commands automatically.")

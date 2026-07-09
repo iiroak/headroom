@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+import stat
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -299,6 +301,66 @@ def test_savings_tracker_save_does_not_flock_target_inode_before_replace(tmp_pat
     assert persisted["lifetime"]["tokens_saved"] == 15
 
 
+def test_savings_tracker_save_fsyncs_parent_directory(tmp_path, monkeypatch):
+    # The file fsync persists contents, but the rename isn't durable until the
+    # parent directory is fsynced too — without it a crash can drop the last
+    # save. Assert a directory fd is fsynced on save. (FP4b)
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path))
+
+    real_fsync = os.fsync
+    dir_fds_synced: list[int] = []
+
+    def _spy_fsync(fd: int) -> None:
+        try:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                dir_fds_synced.append(fd)
+        except OSError:
+            pass
+        real_fsync(fd)
+
+    monkeypatch.setattr(savings_tracker_module.os, "fsync", _spy_fsync)
+
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=120,
+        tokens_saved=10,
+        timestamp="2026-03-27T09:00:00Z",
+    )
+
+    # Parent directory fsynced (rename durable) and the save still landed intact.
+    assert dir_fds_synced, "parent directory was never fsynced after os.replace"
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["lifetime"]["tokens_saved"] == 10
+
+
+def test_savings_tracker_save_survives_directory_fsync_failure(tmp_path, monkeypatch):
+    # On Windows and some virtual filesystems the directory fsync fails — the
+    # save must still complete because the file and atomic rename are already
+    # durable on their own. (FP4b)
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path))
+
+    real_open = os.open
+
+    def _failing_open(target, *args, **kwargs):
+        if str(target) == str(path.parent):
+            raise OSError("directory fsync unsupported")
+        return real_open(target, *args, **kwargs)
+
+    monkeypatch.setattr(savings_tracker_module.os, "open", _failing_open)
+
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=120,
+        tokens_saved=10,
+        timestamp="2026-03-27T09:00:00Z",
+    )
+
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["lifetime"]["tokens_saved"] == 10
+
+
 def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
     def fake_cost_per_token(*, model, prompt_tokens, completion_tokens):
         if model in {"gpt-4o", "anthropic/claude-sonnet-4-6"}:
@@ -423,12 +485,12 @@ def test_fallback_request_pricing_stays_nonzero_with_litellm_unavailable_and_pre
     # LiteLLM unavailable and no opencode reference pricing: falls back to the
     # blended default rate rather than a silent zero (avoids the "zero recorded
     # spend" bug for days/models with real compression savings).
-    assert savings_tracker_module._estimate_compression_savings_usd(
-        "gpt-4o", 100
-    ) == pytest.approx(100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
-    assert savings_tracker_module._estimate_input_cost_usd(
-        "gpt-4o", 100
-    ) == pytest.approx(100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+    assert savings_tracker_module._estimate_compression_savings_usd("gpt-4o", 100) == pytest.approx(
+        100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
+    )
+    assert savings_tracker_module._estimate_input_cost_usd("gpt-4o", 100) == pytest.approx(
+        100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
+    )
     assert savings_tracker_module._estimate_compression_savings_usd(
         "glm-5.2",
         100_000,
@@ -1554,6 +1616,83 @@ def test_stats_history_includes_cli_filtering(tmp_path, monkeypatch):
     assert data["cli_filtering"]["tool"] == "rtk"
     assert data["cli_filtering"]["label"] == "RTK"
     assert data["cli_filtering"]["lifetime"]["tokens_saved"] == 999
+
+
+def test_stats_history_cli_filtering_available_false_when_not_installed(tmp_path, monkeypatch):
+    """Reproduction: /stats-history's curated cli_filtering block must carry
+    `available` reflecting the backend `installed` flag. On origin/main this
+    key doesn't exist in the curated dict at all (`KeyError`); this asserts
+    the fixed key/value. The tool being merely absent must NOT collapse the
+    block to `None` -- it stays populated with `available: False` and zeroed
+    counters so the Historical tab can distinguish absence from a hard
+    read failure.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import headroom.proxy.server as server
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    savings_path = tmp_path / "proxy_savings.json"
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
+
+    _rtk_not_installed_payload = {
+        "tool": "rtk",
+        "label": "RTK",
+        "installed": False,
+        "tokens_saved": 0,
+        "session": {"tokens_saved": 0, "commands": 0},
+        "lifetime": {"tokens_saved": 0, "commands": 0},
+    }
+    monkeypatch.setattr(server, "_get_context_tool_stats", lambda: _rtk_not_installed_payload)
+
+    config = ProxyConfig(
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        log_requests=False,
+    )
+
+    with TestClient(create_app(config)) as client:
+        response = client.get("/stats-history")
+        assert response.status_code == 200
+        data = response.json()
+
+    assert data["cli_filtering"] is not None
+    assert data["cli_filtering"]["available"] is False
+
+
+def test_stats_history_cli_filtering_stays_none_on_hard_read_failure(tmp_path, monkeypatch):
+    """Preservation: /stats-history's cli_filtering key stays `None` only when
+    the underlying stats read hard-fails (exception), not merely because the
+    tool is absent -- the Historical tab keeps hiding the card in that case,
+    unchanged from prior behavior.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import headroom.proxy.server as server
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    savings_path = tmp_path / "proxy_savings.json"
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
+
+    def _raise() -> dict:
+        raise RuntimeError("simulated hard stats-read failure")
+
+    monkeypatch.setattr(server, "_get_context_tool_stats", _raise)
+
+    config = ProxyConfig(
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        log_requests=False,
+    )
+
+    with TestClient(create_app(config)) as client:
+        response = client.get("/stats-history")
+        assert response.status_code == 200
+        data = response.json()
+
+    assert data["cli_filtering"] is None
 
 
 def test_coercion_helpers_reject_non_finite_values():
