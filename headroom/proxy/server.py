@@ -140,6 +140,7 @@ from headroom.proxy.helpers import (
     jitter_delay_ms,
     retry_after_ms,
 )
+from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -163,6 +164,7 @@ from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
 from headroom.proxy.ssl_context import build_httpx_verify
+from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
@@ -1791,10 +1793,8 @@ class HeadroomProxy(
         construct their body from scratch, so canonical serialization is
         correct and original bytes do not exist).
         """
-        from headroom.proxy.helpers import (
-            log_outbound_request,
-            prepare_outbound_body_bytes,
-        )
+        from headroom.proxy.body_forwarding import prepare_outbound_body_bytes
+        from headroom.proxy.helpers import log_outbound_request
 
         last_error = None
         reasons = list(mutation_reasons or [])
@@ -1885,6 +1885,16 @@ class HeadroomProxy(
                 last_error = e
 
                 if not self.config.retry_enabled or attempt >= self.config.retry_max_attempts - 1:
+                    # On exhaustion, preserve the upstream 5xx status (e.g. 503
+                    # Service Unavailable, 500, 502, 504) so the client can apply
+                    # its own retry/backoff. Collapsing every exhausted 5xx into a
+                    # generic 502 hides the retryable signal and makes clients give
+                    # up. The 429/529 overload statuses are already returned
+                    # verbatim by the RETRYABLE_OVERLOAD_STATUSES branch above and
+                    # never reach here. ConnectError/TimeoutException carry no
+                    # response, so those still raise.
+                    if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                        return e.response
                     raise
 
                 # Exponential backoff with jitter
@@ -2056,39 +2066,35 @@ def _request_is_loopback(request: Request) -> bool:
         host_header = request.headers.get("host")
     except AttributeError:
         host_header = None
-    return is_loopback_host(client_host) and is_loopback_host_header(host_header)
 
-
-def _is_known_websocket_callback_failure(context: dict[str, Any]) -> bool:
-    """Return True iff this exact websockets callback failure shape is observed."""
-    if (
-        context.get("message")
-        != "Exception in callback Connection.connection_lost(ConnectionResetError())"
-    ):
+    # The Host-header gate is the DNS-rebinding defence and always applies.
+    if not is_loopback_host_header(host_header):
         return False
-    exception = context.get("exception")
-    return (
-        isinstance(exception, AttributeError)
-        and str(exception) == "'ClientConnection' object has no attribute 'recv_messages'"
+
+    # Genuine loopback peer (native run, or curl inside the container).
+    if is_loopback_host(client_host):
+        return True
+
+    # Containerized dashboards: when Headroom runs in a bridge-network
+    # container, a browser on the host reaches it via the container's
+    # gateway, so ``request.client.host`` is the gateway IP, not 127.0.0.1
+    # — and the per-request logs / upstream URLs get stripped even though
+    # the operator is local. Treat a peer inside an operator-configured
+    # trusted-gateway CIDR as loopback-equivalent. Opt-in and empty by
+    # default (HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS), so this is a no-op
+    # unless the operator explicitly allow-lists their container gateway.
+    from headroom.proxy.forwarded_headers import (
+        load_trusted_gateway_cidrs,
+        peer_is_trusted_gateway,
     )
 
+    return peer_is_trusted_gateway(client_host, load_trusted_gateway_cidrs())
 
-def _tool_schema_saved_from_tags(tags: object) -> int:
-    """Tool-definition tokens Headroom kept out of context for one request by
-    deferring heavy tool schemas: the native tool-search injection
-    (``tool_search_deferred_tokens``) plus any registered turn-hook tools
-    rewrite (``turn_hook_tools_saved_tokens``). Both tags are set only on the
-    path where Headroom performed the deferral, so a client that already had
-    tool search enabled (e.g. Claude Code / Codex) contributes zero here."""
-    if not isinstance(tags, dict):
-        return 0
-    total = 0
-    for key in ("tool_search_deferred_tokens", "turn_hook_tools_saved_tokens"):
-        try:
-            total += int(tags.get(key, 0) or 0)
-        except (TypeError, ValueError):
-            continue
-    return total
+
+_is_known_websocket_callback_failure = is_known_websocket_callback_failure
+
+
+_tool_schema_saved_from_tags = tool_schema_saved_from_tags
 
 
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
@@ -2377,6 +2383,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 dynamic_request_base_url_header="x-headroom-base-url",
                 dynamic_request_base_urls_probed=False,
             ),
+            "kompress": _component_health(
+                enabled=not config.disable_kompress,
+                ready=proxy.warmup.kompress.status == "loaded",
+                backend=proxy.warmup.kompress.info.get("backend", None),
+            ),
         }
 
     def _runtime_payload() -> dict[str, Any]:
@@ -2475,7 +2486,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
         checks = _health_checks()
-        ready = all(check["ready"] for check in checks.values())
+        # Kompress is an optional soft component: model downloads lazily on
+        # first use, so "not ready" (cold cache) must not degrade overall health.
+        ready = all(check["ready"] for name, check in checks.items() if name != "kompress")
         payload: dict[str, Any] = {
             "service": "headroom-proxy",
             "status": "healthy" if ready else "unhealthy",
