@@ -52,7 +52,7 @@ def _opencode_home_dir() -> Path:
 def opencode_config_paths() -> tuple[Path, Path]:
     """Return ``(config_file, backup_file)`` for OpenCode."""
     config_file = opencode_config_path()
-    backup_file = config_file.with_suffix(".json.headroom-backup")
+    backup_file = config_file.with_name(config_file.name + ".headroom-backup")
     return config_file, backup_file
 
 
@@ -306,8 +306,7 @@ def remove_headroom_opencode_plugin_files() -> bool:
 
 
 def _resolve_plugin_spec() -> str:
-    """Resolve a plugin spec OpenCode can load.
-    """
+    """Resolve a plugin spec OpenCode can load."""
     if _plugin_spec_override is not None:
         return _plugin_spec_override
     candidates = (
@@ -322,9 +321,7 @@ def _resolve_plugin_spec() -> str:
     return HEADROOM_OPENCODE_PLUGIN
 
 
-def _make_headroom_plugin_entry(
-    *, proxy_url: str | None = None, mode: str | None = None
-) -> object:
+def _make_headroom_plugin_entry(*, proxy_url: str | None = None, mode: str | None = None) -> object:
     """Build a headroom-opencode plugin entry."""
     options: dict[str, object] = {}
     if proxy_url is not None:

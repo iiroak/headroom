@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
@@ -57,6 +58,8 @@ class GeminiHandlerMixin:
         - fileData: File references (URI + MIME type)
         - functionCall: Function calls from model
         - functionResponse: Responses to function calls
+        - executableCode / codeExecutionResult: Gemini code-execution parts,
+          echoed back in contents[] on later turns
 
         Args:
             content: A single Gemini content entry with 'parts' list.
@@ -68,7 +71,14 @@ class GeminiHandlerMixin:
         for part in parts:
             if any(
                 key in part
-                for key in ("inlineData", "fileData", "functionCall", "functionResponse")
+                for key in (
+                    "inlineData",
+                    "fileData",
+                    "functionCall",
+                    "functionResponse",
+                    "executableCode",
+                    "codeExecutionResult",
+                )
             ):
                 return True
         return False
@@ -326,7 +336,7 @@ class GeminiHandlerMixin:
         # Pre-PR-this Gemini's memory site silently ignored
         # `x-headroom-bypass: true`, mutating request bytes under the
         # user's "don't touch my bytes" signal.
-        from headroom.proxy.helpers import get_memory_injection_mode
+        from headroom.proxy.helpers import get_memory_injection_mode, log_memory_injection
         from headroom.proxy.memory_decision import MemoryDecision
         from headroom.proxy.memory_query import MemoryQuery
 
@@ -423,6 +433,7 @@ class GeminiHandlerMixin:
                         request_id=request_id,
                         provider=provider_name,
                         model=model,
+                        status_code=response.status_code,
                         original_tokens=total_input_tokens,
                         optimized_tokens=total_input_tokens,
                         output_tokens=output_tokens,
@@ -489,6 +500,7 @@ class GeminiHandlerMixin:
                         model_limit=context_limit,
                         context=extract_user_query(messages),
                         waste_messages=waste_messages,
+                        **proxy_pipeline_kwargs(self.config),
                     ),
                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )
@@ -561,6 +573,14 @@ class GeminiHandlerMixin:
                             logger.info(
                                 f"[{request_id}] Memory: Injected {bytes_appended} chars "
                                 f"into latest user message tail for user {memory_user_id} (gemini)"
+                            )
+                            log_memory_injection(
+                                request_id=request_id,
+                                session_id=None,
+                                decision="injected_live_zone_tail_gemini",
+                                bytes_injected=bytes_appended,
+                                query=None,
+                                tags=tags,
                             )
                         else:
                             logger.debug(
@@ -651,7 +671,15 @@ class GeminiHandlerMixin:
                     # Gemini returns cachedContentTokenCount for context-cached tokens
                     # These are charged at 10-25% of the input price depending on model
                     cache_read_tokens = usage.get("cachedContentTokenCount", 0)
-                except (KeyError, TypeError, AttributeError) as e:
+                except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError) as e:
+                    # A non-JSON upstream body (HTML/empty error page from an
+                    # overloaded Google/Vertex frontend) makes response.json()
+                    # raise JSONDecodeError (a ValueError). Without those in the
+                    # tuple it escaped to the outer `except Exception` and became
+                    # a synthetic 502, discarding the real upstream status/body
+                    # and defeating client retry/backoff. Match the all-non-text
+                    # sibling branch above, which falls through to forward the
+                    # real status/content verbatim.
                     logger.debug(
                         f"[{request_id}] Failed to extract cached tokens from Gemini response: {e}"
                     )
@@ -676,6 +704,7 @@ class GeminiHandlerMixin:
                     request_id=request_id,
                     provider=provider_name,
                     model=model,
+                    status_code=response.status_code,
                     original_tokens=original_tokens,
                     optimized_tokens=total_input_tokens,
                     output_tokens=output_tokens,
@@ -844,6 +873,7 @@ class GeminiHandlerMixin:
                         model_limit=context_limit,
                         context=extract_user_query(messages),
                         waste_messages=waste_messages,
+                        **proxy_pipeline_kwargs(self.config),
                     ),
                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )
@@ -1104,6 +1134,7 @@ class GeminiHandlerMixin:
                         model=model,
                         model_limit=context_limit,
                         context=extract_user_query(messages),
+                        **proxy_pipeline_kwargs(self.config),
                     ),
                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )
@@ -1167,6 +1198,7 @@ class GeminiHandlerMixin:
                     request_id=request_id,
                     provider=provider_name,
                     model=model,
+                    status_code=response.status_code,
                     original_tokens=original_tokens,
                     optimized_tokens=compressed_tokens,
                     output_tokens=0,
