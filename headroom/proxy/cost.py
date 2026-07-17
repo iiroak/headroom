@@ -513,7 +513,7 @@ def build_session_summary(
     def _entry_has_number(entry: Any, attr: str) -> bool:
         value = getattr(entry, attr, None)
         return (
-            isinstance(value, (int, float))
+            isinstance(value, int | float)
             and not isinstance(value, bool)
             and math.isfinite(float(value))
         )
@@ -983,7 +983,7 @@ class CostTracker:
             sent = self._tokens_sent_by_model.get(model, 0)
             reqs = self._requests_by_model.get(model, 0)
             total_saved += saved
-            model_stats = {
+            model_stats: dict[str, Any] = {
                 "requests": reqs,
                 "tokens_saved": saved,
                 "tokens_sent": sent,

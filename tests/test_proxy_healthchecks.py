@@ -67,9 +67,7 @@ def test_readyz_reports_core_subsystem_checks(client):
     assert data["checks"]["memory"]["status"] == "disabled"
     assert data["checks"]["upstream"]["provider"] == "anthropic"
     assert data["checks"]["upstream"]["scope"] == "configured_provider_target"
-    assert data["checks"]["upstream"]["dynamic_request_base_url_header"] == (
-        "x-headroom-base-url"
-    )
+    assert data["checks"]["upstream"]["dynamic_request_base_url_header"] == ("x-headroom-base-url")
     assert data["checks"]["upstream"]["dynamic_request_base_urls_probed"] is False
     runtime = data["runtime"]
     assert runtime["anthropic_pre_upstream"]["resolved_concurrency"] == max(

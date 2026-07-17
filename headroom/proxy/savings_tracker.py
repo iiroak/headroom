@@ -264,8 +264,8 @@ def _estimate_compression_savings_usd(
         return float(tokens_saved) * float(reference_pricing.input_cost_per_token)
 
     return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
-
-
+ 
+ 
 def _estimate_output_savings_usd(model: str, tokens_saved: int) -> float:
     """Estimate output-shaping savings in USD from saved *output* tokens.
 
@@ -1356,7 +1356,7 @@ class SavingsTracker:
                 _coerce_float(last.get("total_input_cost_usd")),
             )
 
-        state = {
+        state: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "lifetime": {
                 "requests": lifetime_requests,

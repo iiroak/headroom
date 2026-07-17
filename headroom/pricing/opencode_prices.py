@@ -569,14 +569,10 @@ def reference_pricing_metadata(
         "input_per_1m": round(pricing.input_per_1m, 6),
         "output_per_1m": round(pricing.output_per_1m, 6),
         "cache_read_per_1m": (
-            round(pricing.cache_read_per_1m, 6)
-            if pricing.cache_read_per_1m is not None
-            else None
+            round(pricing.cache_read_per_1m, 6) if pricing.cache_read_per_1m is not None else None
         ),
         "cache_write_per_1m": (
-            round(pricing.cache_write_per_1m, 6)
-            if pricing.cache_write_per_1m is not None
-            else None
+            round(pricing.cache_write_per_1m, 6) if pricing.cache_write_per_1m is not None else None
         ),
         "source_url": pricing.source_url
         or (GO_SOURCE_URL if pricing_surface == OPENCODE_GO_SURFACE else SOURCE_URL),

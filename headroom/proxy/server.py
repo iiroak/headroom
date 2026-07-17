@@ -2120,7 +2120,9 @@ def _history_opencode_pricing_reference(history: dict[str, Any]) -> dict[str, An
 
     def _float(value: object) -> float:
         try:
-            return float(value or 0)
+            if isinstance(value, str | int | float):
+                return float(value)
+            return 0.0
         except (TypeError, ValueError):
             return 0.0
 
