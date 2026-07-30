@@ -80,6 +80,7 @@ _DEBUG_400_DIR = "debug_400"
 _CODEX_WIRE_DEBUG_DIR = "codex_wire"
 _BIN_DIR = "bin"
 _PROXY_CLIENTS_DIR = "clients"
+_OPENCODE_SERVER_CLIENTS_DIR = "opencode-server-clients"
 _RTK_UNIX = "rtk"
 _RTK_WIN = "rtk.exe"
 _LEAN_CTX_UNIX = "lean-ctx"
@@ -348,6 +349,36 @@ def proxy_clients_dir(port: int) -> Path:
     """Per-port dir of live wrap-client markers (one file per client PID)."""
 
     return workspace_dir() / _PROXY_CLIENTS_DIR / str(port)
+
+
+def opencode_server_clients_dir(port: int) -> Path:
+    """Per-port dir of live markers for clients attached to a shared OpenCode server.
+
+    Mirrors :func:`proxy_clients_dir` but tracks ``opencode attach`` clients of
+    one shared ``opencode serve`` process instead of proxy clients, so the
+    server is only torn down once the last attached client exits. Kept in a
+    separate namespace because the two lifetimes are independent: a wrap can
+    hold the proxy without attaching to a server, and vice versa.
+    """
+
+    return workspace_dir() / _OPENCODE_SERVER_CLIENTS_DIR / str(port)
+
+
+def opencode_server_lock_path(port: int) -> Path:
+    """Per-port lock serializing shared-OpenCode-server startup.
+
+    Concurrent ``opencode serve`` launches against a not-yet-migrated database
+    make one of them die with ``database is locked``, so exactly one wrap may
+    be in the "probe, then spawn" window at a time.
+    """
+
+    return workspace_dir() / f".opencode_server_lock_{int(port)}"
+
+
+def opencode_server_log_path(port: int) -> Path:
+    """Return the path for the shared OpenCode server's captured output."""
+
+    return log_dir() / f"opencode-server-{int(port)}.log"
 
 
 def rtk_path() -> Path:

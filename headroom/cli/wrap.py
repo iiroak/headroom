@@ -160,6 +160,9 @@ from headroom.providers.opencode.config import (
     strip_opencode_headroom_blocks,
     strip_opencode_runtime_plugin_config,
 )
+from headroom.providers.opencode.server import (
+    DEFAULT_OPENCODE_SERVER_PORT as _OPENCODE_SERVER_DEFAULT_PORT,
+)
 from headroom.providers.zcode import (
     detect_upstream as _detect_zcode_upstream,
 )
@@ -7673,6 +7676,21 @@ def openclaw(
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
+    "--attach",
+    "attach",
+    is_flag=True,
+    help=(
+        "Attach to a shared 'opencode serve' process instead of launching a "
+        "standalone instance (shares live session state across tabs)"
+    ),
+)
+@click.option(
+    "--server-port",
+    default=None,
+    type=click.IntRange(1, 65535),
+    help=f"Port for the shared OpenCode server (default: {_OPENCODE_SERVER_DEFAULT_PORT})",
+)
+@click.option(
     "--copilot-subscription",
     is_flag=True,
     help="Route headroom/* models through the authenticated GitHub Copilot subscription",
@@ -7695,6 +7713,8 @@ def opencode(
     no_serena: bool,
     code_graph: bool,
     no_proxy: bool,
+    attach: bool,
+    server_port: int | None,
     copilot_subscription: bool,
     learn: bool,
     memory: bool,
@@ -7708,13 +7728,23 @@ def opencode(
     """Launch OpenCode through Headroom proxy.
 
     \b
-    Sets OPENCODE_CONFIG_CONTENT to route all OpenCode API calls through
-    Headroom. Configures a headroom provider via @ai-sdk/openai-compatible.
-    Also sets OPENAI_BASE_URL and ANTHROPIC_BASE_URL as fallbacks.
+    Installs the Headroom OpenCode plugin into OpenCode's own plugin
+    directory and points it at the local proxy via HEADROOM_PROXY_URL. The
+    plugin rewrites provider base URLs (and patches fetch/http for providers
+    that need it), so OpenCode's own provider/model selection is preserved.
+
+    \b
+    With --attach, OpenCode runs in server mode: one shared `opencode serve`
+    process owns the session state and each wrap becomes a thin `opencode
+    attach` client. Tabs in the SAME project then share live state (streaming
+    deltas, "busy" status); separate instances cannot, because a turn's state
+    lives only in the process that issued the prompt. MCP servers are started
+    once per project by the shared server instead of once per tab.
 
     \b
     Examples:
         headroom wrap opencode                         # Start proxy + context tool + opencode
+        headroom wrap opencode --attach                # Share one server across tabs
         headroom wrap opencode -- "fix the bug"        # Pass prompt to opencode
         headroom wrap opencode --no-context-tool       # Skip CLI context-tool setup
         headroom wrap opencode --no-project-rtk        # Keep project AGENTS.md unchanged
@@ -7724,6 +7754,18 @@ def opencode(
         headroom wrap opencode --backend anyllm --anyllm-provider groq
         headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
     """
+    if attach:
+        if copilot_subscription:
+            raise click.ClickException(
+                "--attach cannot be combined with --copilot-subscription: the "
+                "subscription path needs a private, per-wrap seeded proxy, which "
+                "a server shared across projects cannot provide."
+            )
+        if prepare_only:
+            raise click.ClickException("--attach cannot be combined with --prepare-only.")
+    elif server_port is not None:
+        raise click.ClickException("--server-port requires --attach.")
+
     subscription_resolution = None
     if copilot_subscription:
         effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
@@ -7868,13 +7910,27 @@ def opencode(
 
         # Proxy already started by _ensure_proxy above; tell _launch_tool to
         # skip duplicate startup.
+        launch_args = opencode_args
+        if attach:
+            try:
+                launch_args, env, env_vars_display = _prepare_opencode_attach(
+                    binary=opencode_bin,
+                    server_port=server_port or _OPENCODE_SERVER_DEFAULT_PORT,
+                    opencode_args=opencode_args,
+                    env=env,
+                    env_vars_display=env_vars_display,
+                )
+            except RuntimeError as exc:
+                # The `finally` below drops our client marker.
+                raise click.ClickException(str(exc)) from exc
+
         _launch_tool(
             binary=opencode_bin,
-            args=opencode_args,
+            args=launch_args,
             env=env,
             port=actual_port,
             no_proxy=True,
-            tool_label="OPENCODE",
+            tool_label="OPENCODE (ATTACH)" if attach else "OPENCODE",
             env_vars_display=env_vars_display,
             learn=learn,
             memory=memory,
@@ -7885,6 +7941,8 @@ def opencode(
             region=region,
         )
     finally:
+        if attach:
+            _teardown_opencode_server(server_port or _OPENCODE_SERVER_DEFAULT_PORT)
         if _opencode_proxy and _opencode_proxy.poll() is None:
             _other = _live_proxy_clients(actual_port, exclude_self=True)
             if not _other:
@@ -7893,6 +7951,78 @@ def opencode(
                     _opencode_proxy.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     _opencode_proxy.kill()
+
+
+# Set by _prepare_opencode_attach so the teardown in the `finally` block can
+# reach the handle without threading it through _launch_tool.
+_opencode_server_handle: Any = None
+
+
+def _prepare_opencode_attach(
+    *,
+    binary: str,
+    server_port: int,
+    opencode_args: tuple,
+    env: dict[str, str],
+    env_vars_display: list[str],
+) -> tuple[tuple, dict[str, str], list[str]]:
+    """Ensure a shared OpenCode server exists and return attach launch args.
+
+    The Headroom environment moves from the client to the server: ``attach``
+    is only a remote TUI, so the server process is the one that talks to the
+    model and therefore the one that must carry HEADROOM_PROXY_URL. Verified
+    by running a server with that variable set and confirming the plugin
+    rewrote provider base URLs and that requests reached the proxy.
+    """
+    global _opencode_server_handle
+    from headroom.providers.opencode import server as _oc_server
+
+    # The server inherits the Headroom wiring we just built for the client.
+    # HEADROOM_PROJECT is deliberately dropped: one shared server spans several
+    # projects, so a single value would mislabel all but one of them. The
+    # plugin already resolves the project per directory from its own
+    # PluginInput (verified: one plugin instantiation per directory).
+    server_env = {k: v for k, v in env.items() if k != "HEADROOM_PROJECT"}
+
+    # Register before ensure_shared_server so a concurrent wrap's teardown sees
+    # us as an active client and cannot stop the server during the startup gap.
+    _oc_server.register_server_client(server_port)
+    handle = _oc_server.ensure_shared_server(
+        binary=binary,
+        port=server_port,
+        env=server_env,
+        cwd=Path.cwd(),
+    )
+
+    _opencode_server_handle = handle
+    args = tuple(_oc_server.attach_command(handle.url, Path.cwd(), tuple(opencode_args)))
+    display = [
+        *env_vars_display,
+        f"opencode server={handle.url} ({'started' if handle.spawned else 'reused'})",
+        f"attach --dir {Path.cwd()}",
+    ]
+    return args, env, display
+
+
+def _teardown_opencode_server(server_port: int) -> None:
+    """Drop our client marker and stop the shared server when we were last out."""
+    global _opencode_server_handle
+    from headroom.providers.opencode import server as _oc_server
+
+    handle = _opencode_server_handle
+    _opencode_server_handle = None
+    _oc_server.unregister_server_client(server_port)
+
+    if handle is None or handle.process is None or handle.process.poll() is not None:
+        return
+    if _oc_server.live_server_clients(server_port, exclude_self=True):
+        # Other tabs are still attached: leave their server running.
+        return
+    handle.process.terminate()
+    try:
+        handle.process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        handle.process.kill()
 
 
 def _opencode_home_dir() -> Path:

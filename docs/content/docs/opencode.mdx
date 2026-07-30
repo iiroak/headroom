@@ -24,20 +24,69 @@ headroom unwrap opencode
 | Step | What happens |
 |---|---|
 | Proxy | Starts the Headroom proxy unless `--no-proxy` is set |
-| Provider injection | Writes a `headroom` provider using `@ai-sdk/openai-compatible` into `opencode.json`, pointing at `http://127.0.0.1:<port>/v1` |
-| Runtime env | Sets `OPENCODE_CONFIG_CONTENT` with provider, plugin, and optional local MCP config so OpenCode picks up Headroom at launch |
-| Provider compatibility | Leaves `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` untouched so OpenCode `/connect` providers keep their own routing |
+| Plugin install | Copies the Headroom plugin bundle into OpenCode's own plugin directory (`~/.config/opencode/plugins/entry.opencode.js`) |
+| Runtime env | Sets `HEADROOM_PROXY_URL` (and `HEADROOM_OPENCODE_MODE`) so the plugin knows which proxy to route to |
+| Provider routing | The plugin rewrites provider `baseURL`s at runtime and patches `fetch`/`http`; OpenCode's own provider and model selection is preserved |
 | Context tool | Injects RTK (or `lean-ctx`) instructions into `~/.config/opencode/AGENTS.md` and project `AGENTS.md` |
 | MCP setup | Registers the Headroom MCP server (`headroom_compress`, `headroom_retrieve`, `headroom_stats`) |
 | Serena MCP | Optionally registers Serena code graph tools (`--no-serena` to skip) |
 | Backup | Snapshots `opencode.json` to `opencode.json.headroom-backup` before making any changes |
 | Launch | Starts the `opencode` binary through the proxy |
 
+<Callout type="info">
+  `wrap opencode` does **not** set `OPENCODE_CONFIG_CONTENT`, `OPENAI_BASE_URL`,
+  or `ANTHROPIC_BASE_URL`. Routing is handled entirely by the plugin at runtime,
+  which is why your existing provider and model choices survive the wrap.
+</Callout>
+
+## Server Mode (`--attach`)
+
+By default each `headroom wrap opencode` launches a standalone OpenCode
+instance. Instances do **not** share live session state: a turn's "assistant is
+thinking" state lives only in the process that issued the prompt, so a second
+tab in the same project shows an in-flight turn as already finished. The shared
+SQLite database carries the messages but no "running" flag.
+
+`--attach` switches to OpenCode's server mode, where one shared
+`opencode serve` process owns the state and each wrap is a thin
+`opencode attach` client:
+
+```bash
+headroom wrap opencode --attach
+```
+
+Run it in as many projects and tabs as you like — the first invocation starts
+the shared server, the rest reuse it, and it shuts down when the last client
+exits.
+
+| | Default (standalone) | `--attach` (shared server) |
+|---|---|---|
+| Live streaming in a second tab of the same project | No | Yes |
+| `busy` status visible to other tabs | No | Yes |
+| MCP servers | One set per tab | One set per project, started lazily on the first turn |
+| Isolation between projects | Full | Full (sessions and events are scoped per directory) |
+
+The resource win comes from the MCP row: cost becomes a function of how many
+projects are open, not how many tabs. Additional tabs in a project that is
+already open are effectively free.
+
+Notes:
+
+- `--server-port` picks the shared server's port (default `4096`, OpenCode's
+  own preferred port). This is separate from the proxy's `--port`.
+- The server binds `127.0.0.1` only and starts without authentication. If you
+  expose it beyond loopback, set `OPENCODE_SERVER_PASSWORD`.
+- `--attach` cannot be combined with `--copilot-subscription`, which needs a
+  private per-wrap proxy that a server shared across projects cannot provide.
+
+
 ## Options
 
 ```bash
 headroom wrap opencode \
   --port 8787 \
+  --attach \
+  --server-port 4096 \
   --no-rtk \
   --no-mcp \
   --no-serena \
@@ -63,15 +112,16 @@ The generated `headroom` provider exposes these models through the proxy:
 | `headroom/gpt-4o` | GPT-4o, 128K context, 16K output |
 | `headroom/gpt-4.1` | GPT-4.1, 1M context, 32K output |
 
-The default model is `headroom/claude-sonnet-4-6`. Change it in `opencode.json` or in the generated `OPENCODE_CONFIG_CONTENT` payload.
+The default model is `headroom/claude-sonnet-4-6`. Change it in `opencode.json`.
 
 ## Environment Variables
 
 | Variable | Description |
 |---|---|
-| `OPENCODE_CONFIG_CONTENT` | JSON payload with provider, plugin, and optional local MCP config injected by `wrap` |
-| `HEADROOM_PROXY_URL` | Proxy URL passed to Headroom MCP when a non-default port is used, and to the native plugin when configured |
+| `HEADROOM_PROXY_URL` | Proxy URL the plugin routes to; set by `wrap` on the launched process (or on the shared server with `--attach`) |
+| `HEADROOM_OPENCODE_MODE` | `native-fetch` (default) rewrites provider base URLs; `transport` patches `fetch`/`http` instead |
 | `HEADROOM_CONTEXT_TOOL` | Set to `lean-ctx` to use lean-ctx instead of RTK |
+| `OPENCODE_SERVER_PASSWORD` | Basic-auth password for the shared server in `--attach` mode; unset means unauthenticated |
 
 ## Failure Learning
 
@@ -136,17 +186,18 @@ const retrieve = createHeadroomRetrieveTool({
 
 ## How It Works Under The Hood
 
-1. **Config injection**. The wrapper writes a `provider.headroom` block into `opencode.json`. The provider uses `@ai-sdk/openai-compatible`, which OpenCode supports natively. Model mappings route requests through `http://127.0.0.1:<port>/v1`.
-2. **Runtime config**. `OPENCODE_CONFIG_CONTENT` is set as an env var containing provider, plugin, and optional local MCP JSON. OpenCode reads it at startup and merges it with on-disk config.
-3. **MCP tools**. Headroom registers `headroom_compress`, `headroom_retrieve`, and `headroom_stats` through `headroom mcp serve` unless `--no-mcp` is set.
-4. **Native plugin path**. `HeadroomPlugin` installs Headroom transport interception and uses `HEADROOM_PROXY_URL` or `http://127.0.0.1:8787` to reach the proxy.
-5. **Unwrap**. `headroom unwrap opencode` restores `opencode.json` from the pre-wrap backup when present, strips Headroom marker blocks when no backup exists, and unregisters Headroom MCP servers.
+1. **Plugin install**. The wrapper copies its compiled plugin bundle to `~/.config/opencode/plugins/entry.opencode.js`. This is the one loading path that always resolves: OpenCode only resolves external dependencies for files inside its own plugin tree. Exactly one file is installed, because OpenCode treats *every* `*.js` in that directory as a plugin module.
+2. **Runtime routing**. `HEADROOM_PROXY_URL` tells the plugin where the proxy is. In the default `native-fetch` mode the plugin's `config` hook rewrites provider `baseURL`s to `<proxy>/v1`; in `transport` mode it patches `fetch`/`http`/`https` instead. Either way OpenCode's own provider and model selection is preserved.
+3. **Session identity**. The plugin stamps `x-headroom-session-id` with OpenCode's session ID so the proxy never falls back to hashing model + system prompt — that fallback collapses concurrent tabs on the same model and project onto a single session.
+4. **MCP tools**. Headroom registers `headroom_compress`, `headroom_retrieve`, and `headroom_stats` through `headroom mcp serve` unless `--no-mcp` is set.
+5. **Server mode**. With `--attach`, the wrapper starts or reuses one `opencode serve` process (carrying the Headroom environment, since `attach` clients do not talk to the model themselves) and launches `opencode attach <url> --dir <cwd>`. Client markers under `~/.headroom/opencode-server-clients/<port>/` refcount the attached tabs so the server stops only when the last one exits.
+6. **Unwrap**. `headroom unwrap opencode` restores `opencode.json` from the pre-wrap backup when present, strips Headroom marker blocks when no backup exists, and unregisters Headroom MCP servers.
 
 ## Troubleshooting
 
-**OpenCode does not use the headroom provider.**
+**OpenCode does not route through Headroom.**
 
-Check that `OPENCODE_CONFIG_CONTENT` is set and contains the `provider.headroom` block. The wrap command prints the env vars it sets.
+Confirm the plugin is installed (`ls ~/.config/opencode/plugins/`) and that `HEADROOM_PROXY_URL` is set — the wrap command prints the env vars it sets. Then check the resolved provider: `opencode debug config` should show your provider's `baseURL` pointing at `http://127.0.0.1:<port>/v1`.
 
 **The native plugin cannot reach Headroom.**
 

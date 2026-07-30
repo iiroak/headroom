@@ -333,7 +333,7 @@ def test_wrap_opencode_sets_config_content_env(
     assert "OPENCODE_CONFIG_CONTENT" not in env
     assert env["HEADROOM_PROXY_URL"] == "http://127.0.0.1:9000"
     plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
-    assert list(plugin_dir.glob("index.js"))
+    assert list(plugin_dir.glob("entry.opencode.js"))
     assert captured["tool_label"] == "OPENCODE"
     assert captured["agent_type"] == "opencode"
     assert captured["args"] == ("--model", "gpt-4o")
@@ -401,7 +401,7 @@ def test_wrap_opencode_prepare_only_injects_config(
 
     assert result.exit_code == 0, result.output
     plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
-    assert list(plugin_dir.glob("index.js"))
+    assert list(plugin_dir.glob("entry.opencode.js"))
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     if config_file.exists():
         config = json.loads(config_file.read_text())
@@ -1308,3 +1308,371 @@ def test_wrap_opencode_respects_opencode_home_env(
     assert result.exit_code == 0, result.output
     agents_md = Path(custom_home) / "AGENTS.md"
     assert agents_md.exists()
+
+
+# ---------------------------------------------------------------------------
+# Server mode (--attach)
+# ---------------------------------------------------------------------------
+
+
+class _FakeServerProcess:
+    """Stand-in for the shared server's Popen handle."""
+
+    def __init__(self) -> None:
+        self.terminated = False
+        self.killed = False
+        self.wait_timeout: float | None = None
+        self._alive = True
+
+    def poll(self) -> int | None:
+        return None if self._alive else 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self._alive = False
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_timeout = timeout
+        return 0
+
+    def kill(self) -> None:
+        self.killed = True
+        self._alive = False
+
+
+@pytest.fixture
+def attach_server(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Stub the shared-server lifecycle and record how wrap drove it."""
+    from headroom.providers.opencode import server as server_mod
+
+    state: dict[str, object] = {
+        "ensure_calls": [],
+        "registered": [],
+        "unregistered": [],
+        "other_clients": [],
+        "process": _FakeServerProcess(),
+        "spawned": True,
+    }
+
+    def fake_ensure(*, binary: str, port: int, env: dict[str, str], cwd: Path):  # noqa: ANN202
+        state["ensure_calls"].append({"binary": binary, "port": port, "env": env, "cwd": cwd})
+        return server_mod.OpencodeServerHandle(
+            port,
+            state["process"] if state["spawned"] else None,
+            spawned=bool(state["spawned"]),
+        )
+
+    monkeypatch.setattr(server_mod, "ensure_shared_server", fake_ensure)
+    monkeypatch.setattr(
+        server_mod, "register_server_client", lambda port: state["registered"].append(port)
+    )
+    monkeypatch.setattr(
+        server_mod, "unregister_server_client", lambda port: state["unregistered"].append(port)
+    )
+    monkeypatch.setattr(
+        server_mod,
+        "live_server_clients",
+        lambda port, exclude_self=True: list(state["other_clients"]),
+    )
+    return state
+
+
+def _invoke_attach(runner: CliRunner, captured: dict[str, object], *extra: str):  # noqa: ANN202
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="/usr/bin/opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+                return runner.invoke(
+                    main,
+                    ["wrap", "opencode", "--port", "9000", "--no-mcp", "--attach", *extra],
+                )
+
+
+def test_wrap_opencode_attach_launches_attach_client(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attach_server: dict[str, object],
+) -> None:
+    """--attach runs `opencode attach <url> --dir <cwd>` instead of the TUI.
+
+    ``--dir`` is what scopes the remote client to a project: the shared server
+    keeps one instance per directory, which is the difference between sharing
+    live session state with another tab and being isolated from it.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+    result = _invoke_attach(runner, captured)
+
+    assert result.exit_code == 0, result.output
+    args = captured["args"]
+    assert args[0] == "attach"
+    assert args[1] == "http://127.0.0.1:4096"
+    assert args[2] == "--dir"
+    assert Path(str(args[3])) == tmp_path
+    assert captured["tool_label"] == "OPENCODE (ATTACH)"
+
+
+def test_wrap_opencode_attach_forwards_extra_args(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attach_server: dict[str, object],
+) -> None:
+    """Passthrough args land after the attach flags."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+    result = _invoke_attach(runner, captured, "--", "--continue")
+
+    assert result.exit_code == 0, result.output
+    assert captured["args"][-1] == "--continue"
+
+
+def test_wrap_opencode_attach_honours_server_port(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attach_server: dict[str, object],
+) -> None:
+    """--server-port selects the shared server's port, distinct from the proxy port."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+    result = _invoke_attach(runner, captured, "--server-port", "4500")
+
+    assert result.exit_code == 0, result.output
+    assert captured["args"][1] == "http://127.0.0.1:4500"
+    assert attach_server["ensure_calls"][0]["port"] == 4500
+    # The proxy port is unrelated and must stay as requested.
+    assert captured["port"] == 9000
+
+
+def test_wrap_opencode_attach_puts_headroom_env_on_the_server(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attach_server: dict[str, object],
+) -> None:
+    """The server carries HEADROOM_PROXY_URL, since attach is only a remote TUI.
+
+    HEADROOM_PROJECT must NOT be passed to the server: one shared server spans
+    several projects, so a single value would mislabel all but one of them. The
+    plugin resolves the project per directory from its own PluginInput.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+    result = _invoke_attach(runner, captured)
+
+    assert result.exit_code == 0, result.output
+    server_env = attach_server["ensure_calls"][0]["env"]
+    assert server_env["HEADROOM_PROXY_URL"] == "http://127.0.0.1:9000"
+    assert "HEADROOM_PROJECT" not in server_env
+    # The client still gets the project label for its own env.
+    assert captured["env"]["HEADROOM_PROJECT"] == tmp_path.name
+
+
+def test_wrap_opencode_attach_registers_client_before_ensuring_server(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attach_server: dict[str, object],
+) -> None:
+    """Our marker exists before startup so a concurrent teardown spares the server."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    order: list[str] = []
+    from headroom.providers.opencode import server as server_mod
+
+    monkeypatch.setattr(
+        server_mod, "register_server_client", lambda _port: order.append("register")
+    )
+
+    def fake_ensure(*, binary: str, port: int, env: dict[str, str], cwd: Path):  # noqa: ANN202
+        order.append("ensure")
+        return server_mod.OpencodeServerHandle(port, None, spawned=False)
+
+    monkeypatch.setattr(server_mod, "ensure_shared_server", fake_ensure)
+
+    captured: dict[str, object] = {}
+    result = _invoke_attach(runner, captured)
+
+    assert result.exit_code == 0, result.output
+    assert order == ["register", "ensure"]
+
+
+def test_wrap_opencode_attach_stops_server_when_last_client(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attach_server: dict[str, object],
+) -> None:
+    """The wrap that started the server stops it once nobody else is attached."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+    attach_server["other_clients"] = []
+
+    captured: dict[str, object] = {}
+    result = _invoke_attach(runner, captured)
+
+    assert result.exit_code == 0, result.output
+    process = attach_server["process"]
+    assert isinstance(process, _FakeServerProcess)
+    assert process.terminated is True
+    assert attach_server["unregistered"] == [4096]
+
+
+def test_wrap_opencode_attach_keeps_server_for_other_clients(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attach_server: dict[str, object],
+) -> None:
+    """A server with other tabs attached survives this wrap exiting."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+    attach_server["other_clients"] = [4242]
+
+    captured: dict[str, object] = {}
+    result = _invoke_attach(runner, captured)
+
+    assert result.exit_code == 0, result.output
+    process = attach_server["process"]
+    assert isinstance(process, _FakeServerProcess)
+    assert process.terminated is False
+    assert attach_server["unregistered"] == [4096]
+
+
+def test_wrap_opencode_attach_never_stops_a_reused_server(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attach_server: dict[str, object],
+) -> None:
+    """Reusing a server leaves no handle, so teardown cannot kill someone else's."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+    attach_server["spawned"] = False
+
+    captured: dict[str, object] = {}
+    result = _invoke_attach(runner, captured)
+
+    assert result.exit_code == 0, result.output
+    process = attach_server["process"]
+    assert isinstance(process, _FakeServerProcess)
+    assert process.terminated is False
+
+
+def test_wrap_opencode_attach_reports_server_startup_failure(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attach_server: dict[str, object],
+) -> None:
+    """A server that never comes up is a clean CLI error, and our marker is dropped."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+    from headroom.providers.opencode import server as server_mod
+
+    def boom(**_kwargs):  # noqa: ANN003, ANN202
+        raise RuntimeError("did not become ready")
+
+    monkeypatch.setattr(server_mod, "ensure_shared_server", boom)
+
+    captured: dict[str, object] = {}
+    result = _invoke_attach(runner, captured)
+
+    assert result.exit_code != 0
+    assert "did not become ready" in result.output
+    assert attach_server["unregistered"] == [4096]
+
+
+def test_wrap_opencode_without_attach_launches_the_tui(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attach_server: dict[str, object],
+) -> None:
+    """Default behaviour is untouched: no server is ensured, no attach args."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="/usr/bin/opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+                result = runner.invoke(
+                    main, ["wrap", "opencode", "--port", "9000", "--no-mcp", "--", "hola"]
+                )
+
+    assert result.exit_code == 0, result.output
+    assert captured["tool_label"] == "OPENCODE"
+    assert captured["args"] == ("hola",)
+    assert attach_server["ensure_calls"] == []
+    assert attach_server["registered"] == []
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        (["--copilot-subscription"], "--attach cannot be combined with --copilot-subscription"),
+        (["--prepare-only"], "--attach cannot be combined with --prepare-only"),
+    ],
+)
+def test_wrap_opencode_attach_rejects_incompatible_flags(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: list[str],
+    expected: str,
+) -> None:
+    """Incompatible combinations fail before anything on disk is touched."""
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+
+    with patch.object(wrap_mod, "_launch_tool", side_effect=AssertionError("must not launch")):
+        result = runner.invoke(main, ["wrap", "opencode", "--attach", *extra])
+
+    assert result.exit_code != 0
+    assert expected in result.output
+    # Validation runs before the config snapshot, so nothing was written.
+    assert not (tmp_path / ".config" / "opencode").exists()
+
+
+def test_wrap_opencode_server_port_requires_attach(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--server-port without --attach is a usage error, not a silent no-op."""
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+
+    with patch.object(wrap_mod, "_launch_tool", side_effect=AssertionError("must not launch")):
+        result = runner.invoke(main, ["wrap", "opencode", "--server-port", "4500"])
+
+    assert result.exit_code != 0
+    assert "--server-port requires --attach" in result.output
