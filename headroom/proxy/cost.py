@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 
 LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 litellm: Any | None = None
-_UNKNOWN_PRICE_MODELS: set[str] = set()
 
 
 def _get_litellm_module() -> Any | None:
@@ -43,40 +42,23 @@ def _get_litellm_module() -> Any | None:
     return litellm
 
 
-def _has_litellm_pricing_entry(litellm_module: Any, model: str) -> bool:
-    """Return true when LiteLLM has direct or obvious prefixed pricing."""
-    model_cost = getattr(litellm_module, "model_cost", {}) or {}
-    if not isinstance(model_cost, dict):
-        return True
-    if model in model_cost:
-        return True
-
-    try:
-        from headroom.pricing import litellm_pricing
-
-        if model in getattr(litellm_pricing, "_MODEL_ALIASES", {}):
-            return True
-    except Exception:
-        pass
-
-    prefixes = {
-        "claude-": "anthropic/",
-        "gpt-": "openai/",
-        "o1-": "openai/",
-        "o3-": "openai/",
-        "o4-": "openai/",
-        "gemini-": "google/",
-        "minimax-": "minimax/",
-        "deepseek-": "deepseek/",
-    }
-    model_lower = model.lower()
-    for pattern, prefix in prefixes.items():
-        if model_lower.startswith(pattern):
-            return f"{prefix}{model}" in model_cost
-    return False
-
-
 logger = logging.getLogger("headroom.proxy")
+
+# Pricing-lookup warnings are emitted on the per-request cost path, so an
+# unresolvable model (a custom / OpenAI-compatible name LiteLLM can't price,
+# e.g. glm-5.2) floods proxy.log with an identical WARNING every single request
+# (#2504). Track which models have already been warned so each fires once per
+# process; the set is tiny and bounded by the number of distinct models seen.
+_warned_pricing_models: set[str] = set()
+
+
+def _warn_pricing_once(model: str, message: str) -> None:
+    """Emit ``message`` at WARNING only the first time ``model`` fails pricing."""
+    if model in _warned_pricing_models:
+        return
+    _warned_pricing_models.add(model)
+    logger.warning(message)
+
 
 # Provider-specific cache discount multipliers (what fraction of input price)
 # Used to calculate dollar savings from prefix caching
@@ -611,6 +593,15 @@ def build_session_summary(
             "rtk_tokens_avoided": cli_tokens_avoided,
             "total_tokens_saved_with_rtk": metrics.tokens_saved_total + cli_tokens_avoided,
             "total_tokens_before_with_rtk": total_tokens_before,
+            # Tool-schema deferral / turn-hook tool shrink, tracked apart from
+            # message compression. New fields (existing ones stay message+CLI only
+            # for backward compat) so consumers can see the full picture.
+            "tool_schema_tokens_saved": getattr(metrics, "tool_search_saved_total", 0),
+            "total_tokens_saved_all_layers": (
+                metrics.tokens_saved_total
+                + cli_tokens_avoided
+                + getattr(metrics, "tool_search_saved_total", 0)
+            ),
         },
         "uncompressed_requests": {k: v for k, v in uncompressed_reasons.items() if v > 0},
         "cost": {
@@ -743,14 +734,10 @@ class CostTracker:
         """
         litellm = _get_litellm_module()
         if litellm is None:
-            logger.warning("LiteLLM not available - cannot calculate costs")
-            return None
-
-        if model in _UNKNOWN_PRICE_MODELS:
-            return None
-        if not _has_litellm_pricing_entry(litellm, model):
-            _UNKNOWN_PRICE_MODELS.add(model)
-            logger.debug("No LiteLLM pricing available for model %s", model)
+            _warn_pricing_once(
+                f"__litellm_unavailable__:{model}",
+                f"LiteLLM not available - cannot calculate costs for model {model}",
+            )
             return None
 
         try:
@@ -772,8 +759,7 @@ class CostTracker:
             return float(total_cost) if total_cost > 0 else None
 
         except Exception as e:
-            _UNKNOWN_PRICE_MODELS.add(model)
-            logger.debug("Failed to get pricing for model %s: %s", model, e)
+            _warn_pricing_once(model, f"Failed to get pricing for model {model}: {e}")
             return None
 
     def _prune_old_costs(self):

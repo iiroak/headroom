@@ -202,10 +202,28 @@ def _raw_breakdown_totals(entry: Any) -> dict[str, int]:
 
 
 def _resolve_litellm_model(model: str) -> str:
-    """Resolve model name to one LiteLLM recognizes."""
+    """Resolve model name to one LiteLLM recognizes.
+
+    Delegates to the shared alias-map-aware resolver in
+    ``headroom.pricing.litellm_pricing`` so the persisted /stats-history funnel
+    (PROXY $ SAVED tile + Historical Checkpoints) prices gateway aliases like
+    "claude-opus" identically to the live /stats path. Uses the shared result
+    only when it maps to a priced model_cost key; otherwise falls through to the
+    bare-prefix logic below. Fail-soft: pricing never breaks bookkeeping.
+    """
     litellm = _get_litellm_module()
     if litellm is None:
         return model
+
+    try:
+        from headroom.pricing.litellm_pricing import resolve_litellm_model
+
+        resolved = resolve_litellm_model(model)
+        info = litellm.model_cost.get(resolved)
+        if info and info.get("input_cost_per_token") is not None:
+            return resolved
+    except Exception:
+        pass
 
     try:
         litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
@@ -264,8 +282,8 @@ def _estimate_compression_savings_usd(
         return float(tokens_saved) * float(reference_pricing.input_cost_per_token)
 
     return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
- 
- 
+
+
 def _estimate_output_savings_usd(model: str, tokens_saved: int) -> float:
     """Estimate output-shaping savings in USD from saved *output* tokens.
 

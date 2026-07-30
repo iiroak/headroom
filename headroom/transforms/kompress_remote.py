@@ -61,6 +61,9 @@ class RemoteKompressCompressor:
     def is_ready(self) -> bool:
         return True
 
+    def ready_backend(self) -> str | None:
+        return "remote"
+
     def preload(self, *, allow_download: bool = True) -> str:
         return "remote"
 
@@ -102,18 +105,22 @@ class RemoteKompressCompressor:
             compressed = data["compressed"]
             if not isinstance(compressed, str):
                 raise TypeError("remote Kompress response field 'compressed' must be a string")
+            # Coerce the numeric/string metadata fields inside the fail-open guard.
+            # A 200 response with a malformed field (e.g. a non-numeric string, or
+            # an explicit JSON null: data.get returns None for a present key, and
+            # float(None)/int(None) raise) would otherwise escape uncaught and break
+            # the proxy request, defeating the fail-open contract this class promises.
+            result = KompressResult(
+                compressed=compressed,
+                original=content,
+                original_tokens=int(data.get("original_tokens", n_words)),
+                compressed_tokens=int(data.get("compressed_tokens", len(compressed.split()))),
+                compression_ratio=float(data.get("compression_ratio", 1.0)),
+                model_used=str(data.get("model_used", self.config.model_id)),
+            )
         except Exception as e:  # fail OPEN — never break the proxy on a bad endpoint
             logger.warning("Remote Kompress failed (%s); passing through", e)
             return self._passthrough(content, n_words)
-
-        result = KompressResult(
-            compressed=compressed,
-            original=content,
-            original_tokens=int(data.get("original_tokens", n_words)),
-            compressed_tokens=int(data.get("compressed_tokens", len(compressed.split()))),
-            compression_ratio=float(data.get("compression_ratio", 1.0)),
-            model_used=str(data.get("model_used", self.config.model_id)),
-        )
 
         # CCR stays PROXY-LOCAL: endpoint is stateless (enable_ccr=False), so we
         # store the mapping + append the retrieval marker here — same policy and
@@ -122,9 +129,14 @@ class RemoteKompressCompressor:
             cache_key = store_kompress_in_ccr(content, compressed, result.original_tokens)
             if cache_key:
                 result.cache_key = cache_key
+                # Report the source line span so a reader can tell content was
+                # compressed away rather than absent (#2586).
+                source_lines = content.count("\n") + 1
+                line_word = "line" if source_lines == 1 else "lines"
                 result.compressed += (
                     f"\n[{result.original_tokens} items compressed to "
-                    f"{result.compressed_tokens}. Retrieve more: hash={cache_key}]"
+                    f"{result.compressed_tokens} (from {source_lines} source {line_word})."
+                    f" Retrieve more: hash={cache_key}]"
                 )
 
         return result

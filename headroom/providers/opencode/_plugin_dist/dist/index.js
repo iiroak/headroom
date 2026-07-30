@@ -4,8 +4,9 @@ import {
   createHeadroomRetrieveTool,
   getDefaultProxyUrl,
   installHeadroomTransport,
-  setDefaultProxyUrl
-} from "./chunk-FNAHHECN.js";
+  setDefaultProxyUrl,
+  stripTrailingSlashes
+} from "./chunk-O36TDGAF.js";
 
 // src/provider.ts
 var DEFAULT_MODELS = {
@@ -32,7 +33,7 @@ var DEFAULT_MODELS = {
 };
 var DEFAULT_MODEL = "claude-sonnet-4-6";
 function resolveBaseUrl(options) {
-  if (options.proxyBaseUrl) return options.proxyBaseUrl.replace(/\/+$/, "");
+  if (options.proxyBaseUrl) return stripTrailingSlashes(options.proxyBaseUrl);
   const port = options.proxyPort ?? 8787;
   return `http://127.0.0.1:${port}`;
 }

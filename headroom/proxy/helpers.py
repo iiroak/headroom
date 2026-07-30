@@ -929,24 +929,36 @@ async def request_with_transient_retry(
 
 # Image compression availability (do not retain a global compressor instance)
 _image_compressor_available: bool | None = None
+_image_compressor_instance: Any = None
 
 
 def _get_image_compressor():
-    """Create a short-lived image compressor on demand."""
-    global _image_compressor_available
+    """Return the process-wide image compressor, or None if unavailable.
+
+    The compressor caches heavyweight models; creating a new one per request
+    (and a new ONNX router per image) accumulated native memory and grew RSS
+    unboundedly (#2513). Reuse a single shared instance. It is marked a
+    singleton so a caller's per-request ``close()`` is a no-op and the models
+    stay loaded. The main-process handlers only call ``has_images()`` on it (the
+    heavy compression runs in the isolation worker), but sharing still avoids a
+    fresh object per request.
+    """
+    global _image_compressor_available, _image_compressor_instance
     if _image_compressor_available is False:
         return None
+    if _image_compressor_instance is not None:
+        return _image_compressor_instance
 
     try:
         from headroom.image import ImageCompressor
 
-        # Callers own closing the compressor; this helper only memoizes whether
-        # the optional image stack is importable.
-        compressor = ImageCompressor()
+        instance = ImageCompressor()
+        instance._is_singleton = True
         if _image_compressor_available is None:
             logger.info("Image compression enabled (model: chopratejas/technique-router)")
         _image_compressor_available = True
-        return compressor
+        _image_compressor_instance = instance
+        return instance
     except ImportError as e:
         if _image_compressor_available is not False:
             logger.warning(f"Image compression not available: {e}")
@@ -2845,6 +2857,11 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
         "webfetch",
         "question",
         "skill",
+        # A client's own tool-search/schema-fetch tool (Claude Code's ``ToolSearch``).
+        # It resolves tools the client keeps in its local registry and never puts in
+        # the request body (TaskCreate, WebFetch, …), so deferring it hides the only
+        # tool that can load them and they become permanently unreachable.
+        "toolsearch",
     }
 )
 _TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
@@ -2885,11 +2902,22 @@ def inject_tool_search_deferral(
     out: list[Any] = [search_tool]
     deferred = 0
     dropped_cache_control = False
+    dropped_marker: dict[str, Any] | None = None
     last_resident_real: dict[str, Any] | None = None
     resident_has_cache_control = False
 
+    # Clients disagree on casing for the same tool: Claude Code sends ``Bash`` /
+    # ``ToolSearch`` where opencode sends ``bash``. Compare case-insensitively so
+    # the exemption applies to both — an exact match silently deferred *every*
+    # tool for PascalCase clients, including their own tool-search tool.
+    core_lower = {name.lower() for name in core_tools}
+
     for tool in tools:
-        if not isinstance(tool, dict) or tool.get("type") or tool.get("name") in core_tools:
+        if (
+            not isinstance(tool, dict)
+            or tool.get("type")
+            or str(tool.get("name") or "").lower() in core_lower
+        ):
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
             out.append(tool)
@@ -2901,8 +2929,13 @@ def inject_tool_search_deferral(
             continue
         new_tool = dict(tool)
         new_tool["defer_loading"] = True
-        if new_tool.pop("cache_control", None) is not None:
+        _dropped = new_tool.pop("cache_control", None)
+        if _dropped is not None:
             dropped_cache_control = True
+            # Keep the marker itself, not just the fact of it: re-placing a bare
+            # ephemeral would downgrade a 1h breakpoint to the 5m default.
+            if isinstance(_dropped, dict):
+                dropped_marker = _dropped
         out.append(new_tool)
         deferred += 1
 
@@ -2912,7 +2945,9 @@ def inject_tool_search_deferral(
     # deferred tool and no resident tool carries one, move it to the last
     # resident real tool (never the search tool, to keep its shape canonical).
     if dropped_cache_control and not resident_has_cache_control and last_resident_real is not None:
-        last_resident_real["cache_control"] = {"type": "ephemeral"}
+        last_resident_real["cache_control"] = (
+            dict(dropped_marker) if dropped_marker else {"type": "ephemeral"}
+        )
     return out
 
 
@@ -2999,6 +3034,11 @@ def inject_tool_search_deferral_openai(
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0
+    # Case-insensitive for the same reason as the Anthropic path above: the
+    # resident-name sets are lowercase, clients are not required to be.
+    resident_lower = {name.lower() for name in core_tools} | {
+        name.lower() for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+    }
     for tool in tools:
         if not isinstance(tool, dict):
             out.append(tool)
@@ -3008,9 +3048,7 @@ def inject_tool_search_deferral_openai(
         # trained to search namespaces / MCP servers). Everything else — core
         # coding tools and other hosted tools — stays resident.
         deferrable = (
-            ttype == "function"
-            and tool.get("name") not in core_tools
-            and tool.get("name") not in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+            ttype == "function" and str(tool.get("name") or "").lower() not in resident_lower
         ) or ttype == "mcp"
         if deferrable and not tool.get("defer_loading"):
             new_tool = dict(tool)

@@ -77,12 +77,9 @@ def _register_provider_passthrough_route(
     spec: ProviderPassthroughRoute,
 ) -> None:
     async def provider_passthrough(request: Request):
-        headers = dict(request.headers)
-        base_url = (
-            _select_openai_base_url(proxy, headers)
-            if spec.provider_name == "openai"
-            else _api_target(proxy, spec.provider_name)
-        )
+        base_url = _api_target(proxy, spec.provider_name)
+        if spec.provider_name == "openai":
+            base_url = _select_openai_base_url(proxy, dict(request.headers))
         return await proxy.handle_passthrough(
             request,
             base_url,

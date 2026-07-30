@@ -1,5 +1,7 @@
 import type { CompressResult } from "headroom-ai";
 
+import { stripTrailingSlashes } from "./urls.js";
+
 let _proxyUrlCache: string | null = null;
 
 export function setDefaultProxyUrl(url: string): void {
@@ -15,7 +17,7 @@ export interface RetrieveToolConfig {
 }
 
 export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
-  const origin = config.proxyBaseUrl.replace(/\/+$/, "");
+  const origin = stripTrailingSlashes(config.proxyBaseUrl);
 
   return {
     name: "headroom_retrieve",

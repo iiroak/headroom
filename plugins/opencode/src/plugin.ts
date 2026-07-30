@@ -8,6 +8,7 @@ import { z } from "zod";
 
 import { createHeadroomRetrieveTool, getDefaultProxyUrl } from "./retrieve.js";
 import { installHeadroomTransport } from "./transport.js";
+import { stripTrailingSlashes } from "./urls.js";
 
 type HeadroomOpenCodeMode = "native-fetch" | "transport";
 
@@ -20,7 +21,7 @@ export interface HeadroomOpenCodePluginOptions {
 }
 
 function normalizeProxyUrl(url: string): string {
-  return url.replace(/\/+$/, "");
+  return stripTrailingSlashes(url);
 }
 
 function resolveProxyUrl(options?: HeadroomOpenCodePluginOptions): string {

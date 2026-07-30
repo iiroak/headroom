@@ -30,6 +30,28 @@ def _scrub_developer_headroom_env(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
 
 
+# The Copilot "routed to Copilot" flag is a module-global ContextVar that
+# build_copilot_upstream_url() sets as a side effect. Unit tests that call that
+# builder directly (or otherwise run in the shared root context) would leave it
+# set and mislabel a later test's request outcome as "copilot". Reset it around
+# every test so build-time side effects can't leak between tests.
+@pytest.fixture(autouse=True)
+def _reset_copilot_routing_flag():
+    # The macos/windows-native-wrapper CI jobs run the installer tests with only
+    # pytest installed (no headroom): they drive the installer shell scripts via
+    # subprocess, so headroom isn't importable and there's no routing flag to
+    # reset. Skip the reset there instead of erroring at setup.
+    try:
+        from headroom.copilot_auth import reset_request_routed_to_copilot
+    except ModuleNotFoundError:
+        yield
+        return
+
+    reset_request_routed_to_copilot()
+    yield
+    reset_request_routed_to_copilot()
+
+
 # =============================================================================
 # Global test hooks
 # =============================================================================
@@ -87,6 +109,28 @@ def _reset_headroom_logger_propagation():
             # NOTSET so the subtree inherits root's level deterministically.
             logger.setLevel(_logging.NOTSET)
             logger.propagate = True
+    yield
+
+
+# `headroom.providers.opencode.config` installs/removes the compiled plugin
+# bundle inside OpenCode's REAL local-plugin directory
+# (``$OPENCODE_HOME`` or ``~/.config/opencode/plugins``), and
+# `install_headroom_opencode_plugin_files()` deletes everything the manifest
+# lists before rewriting it. Any test that reaches `build_launch_env()` /
+# `inject_opencode_provider_config()` without first pointing HOME at a tmp_path
+# therefore wipes and rewrites the developer's own live OpenCode plugin
+# install — the running `opencode` session then loads a bundle from whatever
+# branch happened to be checked out (or none at all).
+#
+# Redirect OPENCODE_HOME to a per-test tmp dir for EVERY test so the real
+# directory is unreachable by construction. Tests that assert on the path
+# still override HOME/OPENCODE_HOME themselves (monkeypatch wins, and it is
+# applied after this autouse fixture), so this only closes the hole for tests
+# that forgot to isolate.
+@pytest.fixture(autouse=True)
+def _isolate_opencode_home(monkeypatch, tmp_path_factory):
+    sandbox = tmp_path_factory.mktemp("opencode-home")
+    monkeypatch.setenv("OPENCODE_HOME", str(sandbox))
     yield
 
 
