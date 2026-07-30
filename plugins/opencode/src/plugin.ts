@@ -49,6 +49,7 @@ function proxyBaseUrl(proxyUrl: string): string {
 // `x-headroom-base-url` until Headroom's native proxy path supports them.
 const NATIVE_BASE_URL_PROVIDERS = ["anthropic", "openai", "github-copilot"] as const;
 const OPENAI_COMPATIBLE_HEADER = "x-headroom-base-url";
+const SESSION_ID_HEADER = "x-headroom-session-id";
 const ZENMUX_UPSTREAM_BASE = "https://zenmux.ai/api";
 const OPENCODE_PROVIDER_ID = "opencode";
 const OPENCODE_GO_PROVIDER_ID = "opencode-go";
@@ -231,6 +232,16 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
       }
     },
     "chat.headers": async (incoming, output) => {
+      // Stamp OpenCode's own session identity so the proxy never has to fall
+      // back to hashing model + system prompt. That fallback collapses every
+      // concurrent OpenCode instance on the same model and project onto one
+      // session id, cross-contaminating session-sticky state keyed on it
+      // (CCR/memory registries, beta headers, the compression cache).
+      // Applies to every provider, not just the openai-compatible ones below.
+      if (typeof incoming.sessionID === "string" && incoming.sessionID.trim() !== "") {
+        output.headers[SESSION_ID_HEADER] = incoming.sessionID;
+      }
+
       if (
         incoming.model.providerID !== OPENCODE_PROVIDER_ID &&
         incoming.model.providerID !== OPENCODE_GO_PROVIDER_ID

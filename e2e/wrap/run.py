@@ -1018,7 +1018,15 @@ def verify_opencode_wrap(base_env: dict[str, str], project_dir: Path, log_dir: P
     assert_true(manifest_path.exists(), "Opencode wrap should install the local plugin manifest")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     plugin_files = manifest.get("files", [])
-    assert_true("index.js" in plugin_files, "Opencode plugin manifest should include index.js")
+    assert_true(
+        plugin_files == ["entry.opencode.js"],
+        "Opencode plugin manifest should own exactly the standalone entry "
+        f"(OpenCode loads every *.js here); got {plugin_files}",
+    )
+    assert_true(
+        sorted(p.name for p in plugin_dir.glob("*.js")) == ["entry.opencode.js"],
+        "Opencode wrap should leave exactly one loadable plugin module on disk",
+    )
     assert_true(
         all((plugin_dir / name).is_file() for name in plugin_files),
         "Opencode wrap should install every plugin bundle file",

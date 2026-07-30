@@ -4,6 +4,11 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
+// src/plugin.ts
+import { mkdir, unlink, writeFile } from "fs/promises";
+import os from "os";
+import path from "path";
+
 // node_modules/zod/v4/classic/external.js
 var external_exports = {};
 __export(external_exports, {
@@ -735,10 +740,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path) {
-  if (!path)
+function getElementAtPath(obj, path2) {
+  if (!path2)
     return obj;
-  return path.reduce((acc, key) => acc?.[key], obj);
+  return path2.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -1099,11 +1104,11 @@ function aborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path, issues) {
+function prefixIssues(path2, issues) {
   return issues.map((iss) => {
     var _a;
     (_a = iss).path ?? (_a.path = []);
-    iss.path.unshift(path);
+    iss.path.unshift(path2);
     return iss;
   });
 }
@@ -1271,7 +1276,7 @@ function treeifyError(error45, _mapper) {
     return issue2.message;
   };
   const result = { errors: [] };
-  const processError = (error46, path = []) => {
+  const processError = (error46, path2 = []) => {
     var _a, _b;
     for (const issue2 of error46.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
@@ -1281,7 +1286,7 @@ function treeifyError(error45, _mapper) {
       } else if (issue2.code === "invalid_element") {
         processError({ issues: issue2.issues }, issue2.path);
       } else {
-        const fullpath = [...path, ...issue2.path];
+        const fullpath = [...path2, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -1313,8 +1318,8 @@ function treeifyError(error45, _mapper) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path) {
+  const path2 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path2) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -12426,13 +12431,22 @@ function tool(input) {
 }
 tool.schema = external_exports;
 
+// src/urls.ts
+function stripTrailingSlashes(url2) {
+  let end = url2.length;
+  while (end > 0 && url2.charCodeAt(end - 1) === 47) {
+    end -= 1;
+  }
+  return url2.slice(0, end);
+}
+
 // src/retrieve.ts
 var _proxyUrlCache = null;
 function getDefaultProxyUrl() {
   return _proxyUrlCache ?? process.env.HEADROOM_BASE_URL ?? "http://localhost:8787";
 }
 function createHeadroomRetrieveTool(config2) {
-  const origin = config2.proxyBaseUrl.replace(/\/+$/, "");
+  const origin = stripTrailingSlashes(config2.proxyBaseUrl);
   return {
     name: "headroom_retrieve",
     description: "Retrieve original uncompressed content from Headroom's compression store. Use when compressed context mentions a hash and you need the full details. Pass the hash from the compression marker (24 hex characters). Retrieval is by hash and always returns the full original content.",
@@ -12483,96 +12497,14 @@ var nodeRequire = createRequire(import.meta.url);
 var http = nodeRequire("node:http");
 var https = nodeRequire("node:https");
 var http2 = nodeRequire("node:http2");
-var childProcess = nodeRequire("node:child_process");
 var BASE_URL_HEADER = "x-headroom-base-url";
 var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
-var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 var STATE_KEY = /* @__PURE__ */ Symbol.for("headroom.opencode.transport");
 function getState() {
   return globalThis[STATE_KEY];
 }
 function setState(state) {
   globalThis[STATE_KEY] = state;
-}
-function shimImportSpecifier() {
-  return new URL("../hook-shim/handler.js", import.meta.url).href;
-}
-function withNodeImportOption(existing, shim) {
-  const parts = existing?.trim() ? existing.trim().split(/\s+/) : [];
-  const alreadyPresent = parts.some((part, index) => {
-    return part === `--import=${shim}` || part === "--import" && parts[index + 1] === shim;
-  });
-  if (!alreadyPresent) {
-    parts.push(`--import=${shim}`);
-  }
-  return parts.join(" ");
-}
-function withShimEnv(env, proxyUrl) {
-  const nextEnv = { ...env ?? process.env };
-  nextEnv[PROXY_ENV] = proxyUrl;
-  nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shimImportSpecifier());
-  return nextEnv;
-}
-function installProcessEnv(proxyUrl) {
-  process.env[PROXY_ENV] = proxyUrl;
-  process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shimImportSpecifier());
-}
-function isOptions(value) {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value) && !(value instanceof URL);
-}
-function injectOptionsEnv(args, optionIndex, proxyUrl) {
-  const nextArgs = [...args];
-  const callback = typeof nextArgs.at(-1) === "function" ? nextArgs.pop() : void 0;
-  const existing = isOptions(nextArgs[optionIndex]) ? { ...nextArgs[optionIndex] } : {};
-  existing.env = withShimEnv(existing.env, proxyUrl);
-  if (isOptions(nextArgs[optionIndex])) {
-    nextArgs[optionIndex] = existing;
-  } else {
-    nextArgs.splice(optionIndex, 0, existing);
-  }
-  if (callback) {
-    nextArgs.push(callback);
-  }
-  return nextArgs;
-}
-function wrapSpawn(originalSpawn) {
-  return function headroomSpawn(...args) {
-    const state = getState();
-    if (!state) {
-      return Reflect.apply(originalSpawn, this, args);
-    }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
-  };
-}
-function wrapExec(originalExec) {
-  return function headroomExec(...args) {
-    const state = getState();
-    if (!state) {
-      return Reflect.apply(originalExec, this, args);
-    }
-    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state.proxyUrl));
-  };
-}
-function wrapExecFile(originalExecFile) {
-  return function headroomExecFile(...args) {
-    const state = getState();
-    if (!state) {
-      return Reflect.apply(originalExecFile, this, args);
-    }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
-  };
-}
-function wrapFork(originalFork) {
-  return function headroomFork(...args) {
-    const state = getState();
-    if (!state) {
-      return Reflect.apply(originalFork, this, args);
-    }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
-  };
 }
 function normalizeProxyUrl(proxyUrl) {
   return new URL(proxyUrl);
@@ -12688,9 +12620,9 @@ function urlFromRequestOptions(options) {
   }
   const hostname3 = String(hostValue).replace(/:\d+$/, "");
   const port = options.port ? `:${String(options.port)}` : "";
-  const path = String(options.path ?? "/");
+  const path2 = String(options.path ?? "/");
   try {
-    return new URL(`${protocol}//${hostname3}${port}${path}`);
+    return new URL(`${protocol}//${hostname3}${port}${path2}`);
   } catch {
     return void 0;
   }
@@ -12787,7 +12719,6 @@ function installHeadroomTransport(options) {
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
     existing.debug = Boolean(options.debug);
-    installProcessEnv(options.proxyUrl);
     return () => uninstallHeadroomTransport();
   }
   const state = {
@@ -12799,14 +12730,9 @@ function installHeadroomTransport(options) {
     originalHttpGet: http.get,
     originalHttpsRequest: https.request,
     originalHttpsGet: https.get,
-    originalHttp2Connect: http2.connect,
-    originalChildSpawn: childProcess.spawn,
-    originalChildExec: childProcess.exec,
-    originalChildExecFile: childProcess.execFile,
-    originalChildFork: childProcess.fork
+    originalHttp2Connect: http2.connect
   };
   setState(state);
-  installProcessEnv(options.proxyUrl);
   globalThis.fetch = async (...args) => {
     const current = getState();
     if (!current) {
@@ -12821,10 +12747,6 @@ function installHeadroomTransport(options) {
   http.get = wrapGet(http.request);
   https.get = wrapGet(https.request);
   http2.connect = wrapHttp2Connect(state.originalHttp2Connect);
-  childProcess.spawn = wrapSpawn(state.originalChildSpawn);
-  childProcess.exec = wrapExec(state.originalChildExec);
-  childProcess.execFile = wrapExecFile(state.originalChildExecFile);
-  childProcess.fork = wrapFork(state.originalChildFork);
   syncBuiltinESMExports();
   return () => uninstallHeadroomTransport();
 }
@@ -12843,33 +12765,148 @@ function uninstallHeadroomTransport() {
   https.request = state.originalHttpsRequest;
   https.get = state.originalHttpsGet;
   http2.connect = state.originalHttp2Connect;
-  childProcess.spawn = state.originalChildSpawn;
-  childProcess.exec = state.originalChildExec;
-  childProcess.execFile = state.originalChildExecFile;
-  childProcess.fork = state.originalChildFork;
   syncBuiltinESMExports();
   setState(void 0);
 }
 
 // src/plugin.ts
 function normalizeProxyUrl2(url2) {
-  return url2.replace(/\/+$/, "");
+  return stripTrailingSlashes(url2);
 }
 function resolveProxyUrl(options) {
   return normalizeProxyUrl2(
     options?.proxyUrl ?? process.env.HEADROOM_PROXY_URL ?? process.env.HEADROOM_BASE_URL ?? getDefaultProxyUrl()
   );
 }
+function resolveMode(options) {
+  return options?.mode ?? "native-fetch";
+}
+function proxyBaseUrl(proxyUrl) {
+  return `${normalizeProxyUrl2(proxyUrl)}/v1`;
+}
+var NATIVE_BASE_URL_PROVIDERS = ["anthropic", "openai", "github-copilot"];
+var OPENAI_COMPATIBLE_HEADER = "x-headroom-base-url";
+var SESSION_ID_HEADER = "x-headroom-session-id";
+var ZENMUX_UPSTREAM_BASE = "https://zenmux.ai/api";
+var OPENCODE_PROVIDER_ID = "opencode";
+var OPENCODE_GO_PROVIDER_ID = "opencode-go";
+var OPENCODE_GO_UPSTREAM_BASE = "https://opencode.ai/zen/go";
+var HEADROOM_WORKSPACE_DIR_ENV = "HEADROOM_WORKSPACE_DIR";
+var OPENCODE_CLIENT_MARKER_PREFIX = "opencode-";
+function normalizeUpstreamBaseUrl(url2) {
+  const normalized = normalizeProxyUrl2(url2);
+  return normalized.endsWith("/v1") ? normalized.slice(0, -3) : normalized;
+}
+function resolveHeadroomWorkspaceDir() {
+  const override = process.env[HEADROOM_WORKSPACE_DIR_ENV]?.trim();
+  return override || path.join(os.homedir(), ".headroom");
+}
+function resolveProxyClientMarkerDir(proxyUrl) {
+  try {
+    const url2 = new URL(proxyUrl);
+    const port = url2.port || (url2.protocol === "https:" ? "443" : "80");
+    return path.join(resolveHeadroomWorkspaceDir(), "clients", port);
+  } catch {
+    return void 0;
+  }
+}
+async function registerProxyClientMarker(proxyUrl) {
+  const markerDir = resolveProxyClientMarkerDir(proxyUrl);
+  if (!markerDir) {
+    return void 0;
+  }
+  const markerPath = path.join(
+    markerDir,
+    `${OPENCODE_CLIENT_MARKER_PREFIX}${process.pid}-${Date.now()}.json`
+  );
+  try {
+    await mkdir(markerDir, { recursive: true });
+    await writeFile(
+      markerPath,
+      JSON.stringify({
+        pid: process.pid,
+        started_at: Date.now() / 1e3,
+        source: "opencode-plugin"
+      }),
+      "utf8"
+    );
+    return markerPath;
+  } catch {
+    return void 0;
+  }
+}
+async function unregisterProxyClientMarker(markerPath) {
+  if (!markerPath) {
+    return;
+  }
+  try {
+    await unlink(markerPath);
+  } catch {
+  }
+}
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function getExistingProviderOptions(config2, providerId) {
+  if (!isRecord(config2.provider)) {
+    return void 0;
+  }
+  const provider = isRecord(config2.provider[providerId]) ? config2.provider[providerId] : void 0;
+  if (!provider) {
+    return void 0;
+  }
+  const options = isRecord(provider.options) ? provider.options : {};
+  provider.options = options;
+  return options;
+}
+function setOpenAICompatibleUpstreamHeader(options, upstreamBaseUrl) {
+  if (!upstreamBaseUrl) {
+    return;
+  }
+  const headers = isRecord(options.headers) ? options.headers : {};
+  options.headers = headers;
+  headers[OPENAI_COMPATIBLE_HEADER] = upstreamBaseUrl;
+}
+function applyNativeProviderOverrides(config2, proxyUrl) {
+  const baseURL = proxyBaseUrl(proxyUrl);
+  for (const providerId of NATIVE_BASE_URL_PROVIDERS) {
+    const options = getExistingProviderOptions(config2, providerId);
+    if (options) {
+      options.baseURL = baseURL;
+    }
+  }
+  const opencodeOptions = getExistingProviderOptions(config2, OPENCODE_PROVIDER_ID);
+  if (opencodeOptions) {
+    setOpenAICompatibleUpstreamHeader(
+      opencodeOptions,
+      typeof opencodeOptions.baseURL === "string" && opencodeOptions.baseURL.trim() !== "" ? normalizeUpstreamBaseUrl(opencodeOptions.baseURL) : void 0
+    );
+    opencodeOptions.baseURL = baseURL;
+  }
+  const opencodeGoOptions = getExistingProviderOptions(config2, OPENCODE_GO_PROVIDER_ID);
+  if (opencodeGoOptions) {
+    setOpenAICompatibleUpstreamHeader(opencodeGoOptions, OPENCODE_GO_UPSTREAM_BASE);
+    opencodeGoOptions.baseURL = baseURL;
+  }
+  const zenmuxOptions = getExistingProviderOptions(config2, "zenmux");
+  if (zenmuxOptions) {
+    setOpenAICompatibleUpstreamHeader(zenmuxOptions, ZENMUX_UPSTREAM_BASE);
+    zenmuxOptions.baseURL = baseURL;
+  }
+}
 var HeadroomPlugin = async (input, options = {}) => {
   const pluginOptions = options;
   const proxyUrl = resolveProxyUrl(pluginOptions);
+  const mode = resolveMode(pluginOptions);
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     debug: pluginOptions.debug
   });
+  const markerPath = await registerProxyClientMarker(proxyUrl);
   return {
     dispose: async () => {
+      await unregisterProxyClientMarker(markerPath);
       uninstallTransport();
     },
     tool: {
@@ -12883,6 +12920,12 @@ var HeadroomPlugin = async (input, options = {}) => {
         }
       })
     },
+    config: async (config2) => {
+      if (mode !== "native-fetch") {
+        return;
+      }
+      applyNativeProviderOverrides(config2, proxyUrl);
+    },
     "shell.env": async (_input, output) => {
       output.env.HEADROOM_ACTIVE = "1";
       output.env.HEADROOM_PROXY_URL = proxyUrl;
@@ -12890,6 +12933,19 @@ var HeadroomPlugin = async (input, options = {}) => {
       if (pluginOptions.backend) {
         output.env.HEADROOM_BACKEND = pluginOptions.backend;
       }
+    },
+    "chat.headers": async (incoming, output) => {
+      if (typeof incoming.sessionID === "string" && incoming.sessionID.trim() !== "") {
+        output.headers[SESSION_ID_HEADER] = incoming.sessionID;
+      }
+      if (incoming.model.providerID !== OPENCODE_PROVIDER_ID && incoming.model.providerID !== OPENCODE_GO_PROVIDER_ID) {
+        return;
+      }
+      const upstream = typeof incoming.model.api?.url === "string" && incoming.model.api.url.trim() !== "" ? normalizeUpstreamBaseUrl(incoming.model.api.url) : incoming.model.providerID === OPENCODE_GO_PROVIDER_ID ? OPENCODE_GO_UPSTREAM_BASE : void 0;
+      if (!upstream) {
+        return;
+      }
+      output.headers[OPENAI_COMPATIBLE_HEADER] = upstream;
     }
   };
 };

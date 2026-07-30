@@ -35,6 +35,13 @@ HEADROOM_OPENCODE_PLUGIN = "headroom-opencode"
 # `install_headroom_opencode_plugin_files`/`remove_headroom_opencode_plugin_files`).
 _PLUGIN_MANIFEST_FILENAME = ".headroom-plugin-manifest.json"
 
+# The one bundle file installed into OpenCode's plugin directory. OpenCode
+# auto-loads EVERY *.js file it finds there and treats each as a plugin
+# module, so the directory must contain exactly one loadable plugin entry —
+# see `install_headroom_opencode_plugin_files` for why shipping the
+# multi-file library build here registered the plugin three times.
+_PLUGIN_ENTRY_FILENAME = "entry.opencode.js"
+
 
 def _proxy_server_url(port: int) -> str:
     """Return the local Headroom proxy origin used by the OpenCode plugin."""
@@ -185,21 +192,32 @@ _plugin_spec_override: str | None = None
 def _packaged_plugin_dist_dir() -> Path | None:
     """Return the directory holding the pre-built OpenCode plugin bundle.
 
-    Ships inside the ``headroom`` Python package itself
-    (``headroom/providers/opencode/_plugin_dist/dist/``) so it is present in
-    every install path (pip, pipx, uv tool, editable/dev checkout) without
-    depending on an npm registry publish of ``headroom-opencode`` or on a
-    local ``npm run build`` having been run. Falls back to a dev-checkout
-    build under ``plugins/opencode/dist`` if present (e.g. running straight
-    out of a repo checkout after ``npm run build`` there instead).
+    Resolution order mirrors :func:`headroom.providers.opencode.runtime`'s
+    plugin-path lookup, and only ever points at a *standalone* build: the
+    directory is copied wholesale into OpenCode's plugin directory, where
+    OpenCode loads every ``*.js`` file it finds, so a multi-file build there
+    registers the plugin more than once (see
+    :func:`install_headroom_opencode_plugin_files`).
+
+    1. A repo-checkout standalone build (``plugins/opencode/dist-standalone``),
+       so a dev checkout picks up local changes after
+       ``npm run build:standalone``.
+    2. The self-contained bundle shipped inside the wheel
+       (``headroom/providers/opencode/_dist``), present in every install path
+       (pip, pipx, uv tool, editable) without an npm publish or a local build.
     """
-    packaged = Path(__file__).resolve().parent / "_plugin_dist" / "dist"
-    if (packaged / "index.js").is_file():
-        return packaged
     for parents_up in (2, 3):
-        candidate = Path(__file__).resolve().parents[parents_up] / "plugins" / "opencode" / "dist"
-        if (candidate / "index.js").is_file():
+        candidate = (
+            Path(__file__).resolve().parents[parents_up]
+            / "plugins"
+            / "opencode"
+            / "dist-standalone"
+        )
+        if (candidate / _PLUGIN_ENTRY_FILENAME).is_file():
             return candidate
+    packaged = Path(__file__).resolve().parent / "_dist"
+    if (packaged / _PLUGIN_ENTRY_FILENAME).is_file():
+        return packaged
     return None
 
 
@@ -232,22 +250,31 @@ def install_headroom_opencode_plugin_files() -> bool:
     plugin directory is the one loading path that always works, with no
     npm publish and no local build step required from the user.
 
-    Filenames are kept exactly as tsup emitted them (e.g. ``index.js``,
-    content-hashed ``chunk-<hash>.js``): the entry point's bundled relative
-    imports (``./chunk-<hash>.js``) are not rewritten, so renaming any file
-    here would break module resolution. A manifest file
-    (``.headroom-plugin-manifest.json``) records which filenames Headroom
-    owns in this directory, so stale files from a previous bundle version
-    (chunk hashes change between builds) and the whole install can be
-    cleaned up precisely without a naming convention that would collide
-    with the bundle's own internal references.
+    Filenames are kept exactly as tsup emitted them so the manifest file
+    (``.headroom-plugin-manifest.json``) can record which filenames Headroom
+    owns in this directory, letting stale files from a previous bundle
+    version and the whole install be cleaned up precisely without a naming
+    convention that would collide with the bundle's own references.
+
+    Only ``entry.opencode.js`` — the self-contained standalone build — is
+    installed, because OpenCode loads *every* ``*.js`` file in this directory
+    and treats each as a plugin module. Installing the multi-file library
+    build registered the plugin three times over (``index.js`` exports a
+    valid ``PluginModule``, ``entry.opencode.js`` exports the factory, and
+    the shared ``chunk-<hash>.js`` was loaded too), which triple-registered
+    every hook and proxy-client marker, and made OpenCode log a
+    ``failed to load plugin ... Cannot find package 'headroom-ai'`` error on
+    every startup: the chunk alone cannot resolve the bundle's externalized
+    optional dependency. The standalone build has no relative chunk imports
+    and no bare-specifier imports beyond Node builtins, so it loads
+    standalone and registers exactly once.
     """
     dist_dir = _packaged_plugin_dist_dir()
     if dist_dir is None:
         raise click.ClickException(
             "Headroom's OpenCode plugin bundle is missing from this install. "
-            "Reinstall headroom-ai, or run 'npm run build' in plugins/opencode "
-            "if developing from a source checkout."
+            "Reinstall headroom-ai, or run 'npm run build:standalone' in "
+            "plugins/opencode if developing from a source checkout."
         )
 
     target_dir = opencode_plugin_files_dir()
@@ -260,13 +287,13 @@ def install_headroom_opencode_plugin_files() -> bool:
     changed = remove_headroom_opencode_plugin_files()
 
     written: list[str] = []
-    for source_file in sorted(dist_dir.glob("*.js")):
-        dest_file = target_dir / source_file.name
-        new_bytes = source_file.read_bytes()
-        if not dest_file.is_file() or dest_file.read_bytes() != new_bytes:
-            dest_file.write_bytes(new_bytes)
-            changed = True
-        written.append(source_file.name)
+    source_file = dist_dir / _PLUGIN_ENTRY_FILENAME
+    dest_file = target_dir / source_file.name
+    new_bytes = source_file.read_bytes()
+    if not dest_file.is_file() or dest_file.read_bytes() != new_bytes:
+        dest_file.write_bytes(new_bytes)
+        changed = True
+    written.append(source_file.name)
 
     manifest_file.write_text(json.dumps({"files": written}, indent=2) + "\n", encoding="utf-8")
     return changed

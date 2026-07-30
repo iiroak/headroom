@@ -188,6 +188,7 @@ describe("HeadroomPlugin", () => {
 
     expect(output.headers).toEqual({
       "x-headroom-base-url": "https://console.opencode.ai/proxy/connections/fixture",
+      "x-headroom-session-id": "session-1",
     });
   });
 
@@ -219,7 +220,94 @@ describe("HeadroomPlugin", () => {
 
     expect(output.headers).toEqual({
       "x-headroom-base-url": "https://opencode.ai/zen/go",
+      "x-headroom-session-id": "session-1",
     });
+  });
+
+  it("stamps the session id for providers that need no upstream rewrite", async () => {
+    const plugin = await HeadroomPlugin(pluginInput(), {
+      proxyUrl: "http://127.0.0.1:8787",
+      mode: "native-fetch",
+    });
+    const output = { headers: {} as Record<string, string> };
+
+    await plugin["chat.headers"]?.(
+      {
+        sessionID: "ses_04b40bc07ffe4faM8suhMuhW1U",
+        agent: "build",
+        model: {
+          providerID: "anthropic",
+          id: "claude-sonnet-4-5",
+          api: { id: "claude-sonnet-4-5", npm: "@ai-sdk/anthropic" },
+        },
+        provider: { id: "anthropic", source: "custom", info: { id: "anthropic" }, options: {} },
+        message: {},
+      } as never,
+      output,
+    );
+
+    // Without this the proxy falls back to md5(model + system prompt), which
+    // collapses concurrent OpenCode instances on the same model/project onto
+    // a single session id.
+    expect(output.headers).toEqual({
+      "x-headroom-session-id": "ses_04b40bc07ffe4faM8suhMuhW1U",
+    });
+  });
+
+  it("distinguishes concurrent sessions on the same model", async () => {
+    const plugin = await HeadroomPlugin(pluginInput(), {
+      proxyUrl: "http://127.0.0.1:8787",
+      mode: "native-fetch",
+    });
+
+    const headersFor = async (sessionID: string) => {
+      const output = { headers: {} as Record<string, string> };
+      await plugin["chat.headers"]?.(
+        {
+          sessionID,
+          agent: "build",
+          model: {
+            providerID: "anthropic",
+            id: "claude-sonnet-4-5",
+            api: { id: "claude-sonnet-4-5", npm: "@ai-sdk/anthropic" },
+          },
+          provider: { id: "anthropic", source: "custom", info: { id: "anthropic" }, options: {} },
+          message: {},
+        } as never,
+        output,
+      );
+      return output.headers["x-headroom-session-id"];
+    };
+
+    expect(await headersFor("ses_tab_one")).toBe("ses_tab_one");
+    expect(await headersFor("ses_tab_two")).toBe("ses_tab_two");
+  });
+
+  it("omits the session id header when OpenCode supplies none", async () => {
+    const plugin = await HeadroomPlugin(pluginInput(), {
+      proxyUrl: "http://127.0.0.1:8787",
+      mode: "native-fetch",
+    });
+    const output = { headers: {} as Record<string, string> };
+
+    await plugin["chat.headers"]?.(
+      {
+        sessionID: "   ",
+        agent: "build",
+        model: {
+          providerID: "anthropic",
+          id: "claude-sonnet-4-5",
+          api: { id: "claude-sonnet-4-5", npm: "@ai-sdk/anthropic" },
+        },
+        provider: { id: "anthropic", source: "custom", info: { id: "anthropic" }, options: {} },
+        message: {},
+      } as never,
+      output,
+    );
+
+    // An empty header would become the session id verbatim in the proxy, which
+    // is worse than letting the hash fallback run.
+    expect(output.headers).toEqual({});
   });
 
   it("adds only Headroom metadata to shell env", async () => {

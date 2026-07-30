@@ -14,6 +14,7 @@ from headroom.providers.opencode.config import (
     _resolve_plugin_spec,
     append_headroom_plugin,
     inject_opencode_provider_config,
+    install_headroom_opencode_plugin_files,
     opencode_config_paths,
     remove_headroom_plugin,
     snapshot_opencode_config_if_unwrapped,
@@ -211,7 +212,7 @@ def test_inject_provider_config_creates_file(
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     assert not config_file.exists()
     plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
-    installed = list(plugin_dir.glob("index.js"))
+    installed = list(plugin_dir.glob("entry.opencode.js"))
     assert installed, "expected Headroom plugin files under OpenCode's plugin directory"
 
 
@@ -220,9 +221,9 @@ def test_inject_provider_config_idempotent(tmp_path: Path, monkeypatch: pytest.M
     _set_test_home(monkeypatch, tmp_path)
     inject_opencode_provider_config(port=8787)
     plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
-    first_run = {p.name: p.read_bytes() for p in plugin_dir.glob("index.js")}
+    first_run = {p.name: p.read_bytes() for p in plugin_dir.glob("entry.opencode.js")}
     inject_opencode_provider_config(port=9999)
-    second_run = {p.name: p.read_bytes() for p in plugin_dir.glob("index.js")}
+    second_run = {p.name: p.read_bytes() for p in plugin_dir.glob("entry.opencode.js")}
     assert first_run.keys() == second_run.keys()
     assert first_run == second_run
 
@@ -361,7 +362,7 @@ def test_inject_provider_config_merges_with_existing_mcp(
     assert "headroom" not in config["mcp"]
     assert "plugin" not in config
     plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
-    assert list(plugin_dir.glob("index.js"))
+    assert list(plugin_dir.glob("entry.opencode.js"))
 
 
 def test_inject_provider_config_idempotent_with_complex_config(
@@ -549,7 +550,7 @@ def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert "OPENAI_BASE_URL" not in env
     assert "ANTHROPIC_BASE_URL" not in env
     plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
-    assert list(plugin_dir.glob("index.js"))
+    assert list(plugin_dir.glob("entry.opencode.js"))
 
 
 def test_build_launch_env_with_custom_environ() -> None:
@@ -586,9 +587,77 @@ def test_inject_provider_config_strips_existing_markers(
     plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
 
     inject_opencode_provider_config(port=9000)
-    first = sorted(p.name for p in plugin_dir.glob("index.js"))
+    first = sorted(p.name for p in plugin_dir.glob("entry.opencode.js"))
     assert first
 
     inject_opencode_provider_config(port=9001)
-    second = sorted(p.name for p in plugin_dir.glob("index.js"))
+    second = sorted(p.name for p in plugin_dir.glob("entry.opencode.js"))
     assert second == first
+
+
+# ---------------------------------------------------------------------------
+# Plugin directory hygiene — OpenCode loads EVERY *.js file placed here
+# ---------------------------------------------------------------------------
+
+
+def test_plugin_dir_holds_exactly_one_loadable_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only one plugin module may land in OpenCode's plugin directory.
+
+    OpenCode auto-loads every ``*.js`` file there and treats each as a plugin
+    module. Shipping the multi-file library build registered the plugin three
+    times over (``index.js`` exports a valid ``PluginModule``,
+    ``entry.opencode.js`` exports the factory, and the shared chunk was
+    loaded as well), which triple-registered every hook and wrote three
+    proxy-client markers per process.
+    """
+    _set_test_home(monkeypatch, tmp_path)
+    install_headroom_opencode_plugin_files()
+    plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
+
+    js_files = sorted(p.name for p in plugin_dir.glob("*.js"))
+    assert js_files == ["entry.opencode.js"]
+
+
+def test_installed_plugin_entry_has_no_external_imports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The installed entry must resolve without a node_modules tree.
+
+    The library build left ``headroom-ai`` externalized and split the code
+    into a shared chunk, so OpenCode logged
+    ``failed to load plugin ... Cannot find package 'headroom-ai'`` on every
+    startup. The standalone build must import nothing but Node builtins and
+    must not reference a sibling chunk.
+    """
+    _set_test_home(monkeypatch, tmp_path)
+    install_headroom_opencode_plugin_files()
+    entry = tmp_path / ".config" / "opencode" / "plugins" / "entry.opencode.js"
+    source = entry.read_text(encoding="utf-8", errors="replace")
+
+    assert "headroom-ai" not in source
+    assert "./chunk-" not in source
+
+
+def test_install_prunes_stale_multi_file_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Upgrading from the old multi-file bundle removes the extra modules."""
+    _set_test_home(monkeypatch, tmp_path)
+    plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    # Simulate a pre-upgrade install: the manifest owns three files.
+    (plugin_dir / "index.js").write_text("// stale library barrel\n", encoding="utf-8")
+    (plugin_dir / "chunk-DEADBEEF.js").write_text("// stale chunk\n", encoding="utf-8")
+    (plugin_dir / "entry.opencode.js").write_text("// stale entry\n", encoding="utf-8")
+    (plugin_dir / ".headroom-plugin-manifest.json").write_text(
+        json.dumps({"files": ["index.js", "chunk-DEADBEEF.js", "entry.opencode.js"]}),
+        encoding="utf-8",
+    )
+
+    install_headroom_opencode_plugin_files()
+
+    assert sorted(p.name for p in plugin_dir.glob("*.js")) == ["entry.opencode.js"]
+    manifest = json.loads((plugin_dir / ".headroom-plugin-manifest.json").read_text())
+    assert manifest["files"] == ["entry.opencode.js"]
